@@ -1,65 +1,53 @@
-# 灵犀拼音 · Linux 端工作区
+# 灵犀拼音 · Linux（fcitx5）
 
-迁自 `lingxi-windows/fcitx5-prisir`（2026-11-20），与 Android / Windows 工作区并列。
+本地中文拼音输入法（fcitx5 插件）。与 [Android](https://github.com/63894696/lingxi-android)、[Windows](https://github.com/63894696/lingxi-windows) 共用同一套 Rust 引擎，候选、整句与词库学习行为一致。
 
-## 布局
+**官网下载**：https://www.babelspan.com/prisir-ime.html  
+**许可证**：Apache License 2.0
 
-| 路径 | 说明 |
+## 功能概览
+
+- **拼音输入**：全拼 / 混拼候选、整句解码、学习上屏
+- **简繁切换**：本地转换（与桌面端快捷键/状态栏对齐）
+- **语音输入（可选）**：本机识别浮层，不外发音频
+- **个人词库**：选词自学习；词库与学习数据百分百本机自主管理
+- **开放 API（可选）**：默认关闭；开启后仅监听本机 `127.0.0.1`，供本机 AI Agent / 脚本协助配置
+
+## 隐私
+
+严格隐私保护，完全离线无账号：
+
+- 键入内容、候选与词库只保存在本机，不上传输入正文
+- 无账号登录、无行为画像、不出售输入数据
+- 输入法本身不主动发起任何网络请求
+- 开放 API 默认关闭；开启后也不对外网暴露
+
+## 仓库结构（简述）
+
+| 目录 | 说明 |
 |------|------|
-| `fcitx5-prisir/` | fcitx5 addon（C++，dlopen 同源引擎） |
-| `prisir_ime/` | **目录联接** → `D:\Projects\lingxi-android\prisir_ime` |
+| `fcitx5-prisir/` | fcitx5 addon（C++，加载同源引擎） |
+| `prisir_ime/` | 同源 Rust 引擎 |
+| `scripts/` | 打包与构建辅助脚本 |
+| `dist/` | 本地构建产物（如 `.deb`） |
 
-## 调试机
+## 安装
 
-| 别名 | 地址 |
-|------|------|
-| `lingxi-sf01-lan` | `192.168.0.102`（推荐） |
-| `lingxi-sf01` / Tailscale | `100.117.50.20`（`sf01`） |
-
-## 当前包（2026-11-21）
-
-已在 SF01 安装 **`fcitx5-prisir 0.3.0`**（Win 选择性迁移）：
-
-- 修 IC `registerProperty`（解决 0.1.0 精简包崩溃）
-- 状态区：词库 / 符号 / 手写 / 语音 / 简繁 / 关于（**无 AI 助手**）
-- 引擎为当前 `prisir_ime`；`smoke_matrix` **15/15 通过**
-
-本地产物：`dist/fcitx5-prisir_0.3.0_amd64.deb`
+需要已安装 **fcitx5**。从官网下载最新 `.deb`（amd64），例如：
 
 ```bash
-# 引擎：WSL 编（SF01 内存小、rustup 慢）
-wsl -d Ubuntu-24.04 -- bash /mnt/d/Projects/lingxi-linux/scripts/wsl_build_engine.sh
-# addon + deb：SF01
-ssh lingxi-sf01-lan 'cd /root/lingxi-linux && cmake -B fcitx5-prisir/build -S fcitx5-prisir && cmake --build fcitx5-prisir/build'
-# 上传 .so 后
-ssh lingxi-sf01-lan 'cd /root/lingxi-linux && bash scripts/pack_deb.sh --addon fcitx5-prisir/build/prisir.so --engine dist/libprisir_ime.so --db assets/ciku.db --out dist/fcitx5-prisir_0.1.0_amd64.deb && dpkg -i dist/fcitx5-prisir_0.1.0_amd64.deb'
+sudo dpkg -i fcitx5-prisir_0.3.6_amd64.deb
+# 若有依赖缺失：
+sudo apt -f install
 ```
 
-桌面端在 fcitx5 配置里加「灵犀拼音」后即可输入。
+在 fcitx5 配置中添加「灵犀 / prisir」输入法并切换即可。
 
-## 功能迁移取舍（对照 0.2.0 原版托盘，SF01 实测）
+## 相关链接
 
-| 功能 | Linux 可行性 | 建议 |
-|------|-------------|------|
-| 拼音打字 / 候选 / 学习 | ✅ 已通（0.2.0） | 保留；P0 精简 `prisir.so` 需修 IC 属性崩溃后再升引擎 |
-| 词库管理 / 符号大全 / 关于 | ✅ GTK 本机脚本，无特殊限制 | 保留 |
-| 手写 | ❌ 与安卓同为自研 ONNX（ochw），精度远差于 Win **系统 Ink**；安卓已下线 | **去除** |
-| 语音 | ✅ Win `lingxi_voice` = SenseVoice Small + **onnxruntime**（跨平台） | **迁移**：同模型 `sensevoice-small/`，Linux 用 sounddevice 录音 |
-| AI 助手 | ❌ 外挂 PrisirAI | **去除** |
-| 开放 API | ✅ `127.0.0.1:23331` | **已实现**（默认关闭） |
+- 官网介绍与安装包：https://www.babelspan.com/prisir-ime.html
+- Android 仓：https://github.com/63894696/lingxi-android
+- Windows 仓：https://github.com/63894696/lingxi-windows
+- 问题反馈：https://bbs.babelspan.com/forum.html#board=browser/ime&hint=prisirai
 
-原则：手写不迁；**语音迁 Win 同款 SenseVoice**；AI 不进输入法。
-
-语音模型安装（约 230MB，不打进 deb）：
-
-```bash
-mkdir -p /usr/lib/fcitx5/prisir/voice/sensevoice-small
-# 从 Win 安装树复制 model.onnx + tokens.json（及 config.yaml）
-pip3 install numpy onnxruntime sounddevice
-```
-
-## 后续
-
-1. **修 P0 崩溃**：对齐 0.2.0 的 `libprisir` IC 属性用法，再挂新引擎
-2. **P1**：开放 API + 简繁 + 基础配置
-3. 手写/语音仅按需外挂，不阻塞主线
+版权所有 © 2026 BabelSpan。
