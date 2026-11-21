@@ -1,0 +1,13 @@
+[Unit]
+Description=Lingxi Open API (localhost)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/fcitx5/prisir/prisir_openapi --start
+ExecStop=/usr/lib/fcitx5/prisir/prisir_openapi --stop
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+[Install]
+WantedBy=default.target

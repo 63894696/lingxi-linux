@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=灵犀开放 API
+Comment=Lingxi Open API (127.0.0.1) — starts only if enabled
+Exec=/usr/lib/fcitx5/prisir/prisir_openapi --start
+TryExec=/usr/lib/fcitx5/prisir/prisir_openapi
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=4
+StartupNotify=false

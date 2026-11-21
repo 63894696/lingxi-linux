@@ -1,0 +1,42 @@
+# Build / IDE
+**/target/
+**/build/
+**/.idea/
+**/.vscode/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+**/*.so
+**/*.a
+**/*.o
+
+# Lexicon / models / packages
+**/*.db
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+**/*.midx
+**/*.idx
+**/*.onnx
+**/sensevoice-small/
+/dist/
+**/*.deb
+
+# Python
+**/__pycache__/
+**/*.pyc
+.venv/
+_venv*/
+
+# Logs / temp
+**/*.log
+**/scripts/_sf01_*.sh
+**/scripts/_remote_*.sh
+**/scripts/_*.sh
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+*~

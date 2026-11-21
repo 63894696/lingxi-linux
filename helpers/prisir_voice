@@ -1,0 +1,1109 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""灵犀语音听写 (Linux) — 对齐 Win lingxi_voice 常驻模型：
+
+  1) 菜单点「语音听写」= 确保 daemon 在跑 + toggle（开始/停止识别上屏）
+  2) 默认全局热键：右侧 Alt（Alt_R）按一下录音，再按一下识别上屏
+  3) 「语音热键」设置窗可改快捷键（写入 ~/.config/prisir/voice.json）
+
+Win 对照：
+  - GetAsyncKeyState(TRIGGER_KEY) 轮询 → 此处 pynput 监听 / X11 轮询
+  - PrisirLingXi_VoiceToggle_Event → 此处 Unix socket toggle
+  - lingxi_config.TRIGGER_KEY → ~/.config/prisir/voice.json hotkey
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+
+for _k, _v in (("GTK_IM_MODULE", "fcitx"), ("QT_IM_MODULE", "fcitx"), ("XMODIFIERS", "@im=fcitx")):
+    if not os.environ.get(_k):
+        os.environ[_k] = _v
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gdk
+
+SAMPLE_RATE = 16000
+N_MELS, FRAME_LENGTH_MS, FRAME_SHIFT_MS = 80, 25, 10
+LFR_M, LFR_N, N_FFT, PREEMPH_COEF = 7, 6, 512, 0.97
+
+CFG_DIR = Path.home() / ".config" / "prisir"
+CFG_PATH = CFG_DIR / "voice.json"
+DEFAULT_HOTKEY = "alt_r"  # 对齐 Win VK_RMENU
+
+# 允许的热键（名称 → 显示名）。与 Win 允许集接近：右/左 Alt + F1–F12
+HOTKEY_CHOICES = {
+    "alt_r": "右 Alt",
+    "alt_l": "左 Alt",
+    "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4",
+    "f5": "F5", "f6": "F6", "f7": "F7", "f8": "F8",
+    "f9": "F9", "f10": "F10", "f11": "F11", "f12": "F12",
+}
+
+
+def _runtime_dir() -> Path:
+    d = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/prisir-{os.getuid()}")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        d = Path(f"/tmp/prisir-{os.getuid()}")
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def sock_path() -> Path:
+    return _runtime_dir() / "prisir_voice.sock"
+
+
+def pid_path() -> Path:
+    return _runtime_dir() / "prisir_voice.pid"
+
+
+def load_cfg() -> dict:
+    cfg = {"hotkey": DEFAULT_HOTKEY, "float_x": None, "float_y": None}
+    if CFG_PATH.exists():
+        try:
+            data = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg.update(data)
+        except Exception:
+            pass
+    if cfg.get("hotkey") not in HOTKEY_CHOICES:
+        cfg["hotkey"] = DEFAULT_HOTKEY
+    return cfg
+
+
+def save_cfg(cfg: dict) -> None:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    CFG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _ensure_display_env(env: dict | None = None) -> dict:
+    """补齐 DISPLAY/XAUTHORITY，避免重启后从 fcitx fork 出的进程无 X 权限。"""
+    e = dict(env or os.environ)
+    if not e.get("DISPLAY"):
+        e["DISPLAY"] = ":0"
+    if not e.get("XAUTHORITY"):
+        home = e.get("HOME") or str(Path.home())
+        for cand in (
+            Path(home) / ".Xauthority",
+            Path("/run/user") / str(os.getuid()) / "gdm" / "Xauthority",
+        ):
+            if cand.exists():
+                e["XAUTHORITY"] = str(cand)
+                break
+    if not e.get("XDG_RUNTIME_DIR"):
+        e["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+    return e
+
+
+def _find_model_dir() -> Path:
+    here = Path(__file__).resolve().parent
+    cands = [
+        Path(os.environ["PRISIR_VOICE_MODEL"]) if os.environ.get("PRISIR_VOICE_MODEL") else None,
+        here / "voice" / "sensevoice-small",
+        Path("/usr/lib/fcitx5/prisir/voice/sensevoice-small"),
+        here / "sensevoice-small",
+    ]
+    for c in cands:
+        if c and (c / "model.onnx").exists() and (c / "tokens.json").exists():
+            return c
+    return Path("/usr/lib/fcitx5/prisir/voice/sensevoice-small")
+
+
+MODEL_DIR = _find_model_dir()
+
+
+def _deps_missing():
+    miss = []
+    for m in ("numpy", "onnxruntime", "sounddevice"):
+        try:
+            __import__(m)
+        except ImportError:
+            miss.append(m)
+    return miss
+
+
+def _hamming(L):
+    import numpy as np
+    return 0.54 - 0.46 * np.cos(2 * np.pi * np.arange(L) / (L - 1))
+
+
+def _preemphasis(x, coef=PREEMPH_COEF):
+    import numpy as np
+    return np.append(x[0], x[1:] - coef * x[:-1]) if coef > 0 else x
+
+
+def _mel_fb(n_mels, n_fft, sr):
+    import numpy as np
+
+    def h2m(f):
+        return 2595.0 * np.log10(1.0 + f / 700.0)
+
+    def m2h(m):
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    hz = m2h(np.linspace(h2m(0.0), h2m(sr / 2.0), n_mels + 2))
+    bin_f = np.linspace(0, sr / 2, n_fft // 2 + 1)
+    fb = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
+    for i in range(n_mels):
+        l, c, r = hz[i], hz[i + 1], hz[i + 2]
+        for j, f in enumerate(bin_f):
+            if l <= f <= c:
+                fb[i, j] = (f - l) / (c - l)
+            elif c < f <= r:
+                fb[i, j] = (r - f) / (r - c)
+    return fb
+
+
+def extract_features(audio, sr=SAMPLE_RATE):
+    import numpy as np
+    audio = _preemphasis(audio.astype(np.float32), PREEMPH_COEF)
+    flen, fshift = int(FRAME_LENGTH_MS * sr / 1000), int(FRAME_SHIFT_MS * sr / 1000)
+    win, fb = _hamming(flen), _mel_fb(N_MELS, N_FFT, sr)
+    n_frames = max(1, (len(audio) - flen) // fshift + 1)
+    if len(audio) < flen:
+        audio = np.pad(audio, (0, flen - len(audio)))
+    frames = np.lib.stride_tricks.as_strided(
+        audio, shape=(n_frames, flen),
+        strides=(audio.strides[0] * fshift, audio.strides[0])).copy() * win
+    power = np.abs(np.fft.rfft(frames, n=N_FFT, axis=1)) ** 2
+    mel_log = np.log10(np.maximum(power @ fb.T, 1e-10))
+    mel_log = (mel_log - mel_log.mean(axis=0, keepdims=True)) / (mel_log.std(axis=0, keepdims=True) + 1e-5)
+    if n_frames < LFR_M:
+        mel_log = np.concatenate([mel_log, np.zeros((LFR_M - n_frames, N_MELS), dtype=np.float32)])
+        n_frames = LFR_M
+    n_lfr = (n_frames - LFR_M) // LFR_N + 1
+    out = np.zeros((n_lfr, N_MELS * LFR_M), dtype=np.float32)
+    for i in range(n_lfr):
+        out[i] = mel_log[i * LFR_N: i * LFR_N + LFR_M].flatten()
+    return out
+
+
+def greedy_decode(logits, id2tok, blank_id=0):
+    preds = logits.argmax(axis=-1)
+    result, prev = [], -1
+    for p in preds:
+        if p != prev and p != blank_id:
+            result.append(int(p))
+        prev = p
+    text = ""
+    for idx in result:
+        if idx >= len(id2tok):
+            continue
+        tok = id2tok[idx]
+        if tok.startswith("<|") and tok.endswith("|>"):
+            continue
+        text += " " if tok == "▁" else tok.replace("▁", " ")
+    return text.strip()
+
+
+class SenseVoice:
+    def __init__(self):
+        self.session = None
+        self.id2tok = None
+        self._infer_lock = threading.Lock()
+
+    def load(self):
+        import onnxruntime as ort
+        if not (MODEL_DIR / "model.onnx").exists() or not (MODEL_DIR / "tokens.json").exists():
+            return False, f"模型未找到: {MODEL_DIR}"
+        try:
+            self.session = ort.InferenceSession(
+                str(MODEL_DIR / "model.onnx"), providers=["CPUExecutionProvider"])
+            toks = json.loads((MODEL_DIR / "tokens.json").read_text(encoding="utf-8"))
+            self.id2tok = {i: t for i, t in enumerate(toks)}
+            return True, "模型就绪"
+        except Exception as e:
+            return False, f"模型加载失败: {e}"
+
+    def transcribe(self, pcm, sr=SAMPLE_RATE, language=0, textnorm=14):
+        import numpy as np
+        if self.session is None:
+            return ""
+        if pcm.dtype != np.float32:
+            pcm = pcm.astype(np.float32) / (32768.0 if pcm.dtype == np.int16 else 1.0)
+        feats = extract_features(pcm, sr)
+        feed = {
+            "speech": feats[np.newaxis, :, :].astype(np.float32),
+            "speech_lengths": np.array([feats.shape[0]], dtype=np.int32),
+            "language": np.array([language], dtype=np.int32),
+            "textnorm": np.array([textnorm], dtype=np.int32),
+        }
+        # 流式预览与定稿可能并发，ORT session 加锁
+        with self._infer_lock:
+            return greedy_decode(self.session.run(None, feed)[0][0], self.id2tok)
+
+
+class Recorder:
+    def __init__(self):
+        self._frames, self._stream, self.recording = [], None, False
+        self._lock = threading.Lock()
+
+    def _cb(self, indata, frames, ti, st):
+        if self.recording:
+            self._frames.append(indata.copy())
+
+    def start(self):
+        import sounddevice as sd
+        with self._lock:
+            self._stop_locked()
+            self._frames, self.recording = [], True
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                blocksize=1024, callback=self._cb)
+            self._stream.start()
+
+    def _stop_locked(self):
+        self.recording = False
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def snapshot(self):
+        """不停止录音，拷贝当前已录 PCM（供流式预览）。"""
+        import numpy as np
+        with self._lock:
+            if not self._frames:
+                return np.array([], dtype=np.float32)
+            return np.concatenate(self._frames, axis=0).flatten().astype(np.float32) / 32768.0
+
+    def stop(self):
+        import numpy as np
+        with self._lock:
+            self._stop_locked()
+            if not self._frames:
+                return np.array([], dtype=np.float32)
+            return np.concatenate(self._frames, axis=0).flatten().astype(np.float32) / 32768.0
+
+
+def _has_xdotool() -> bool:
+    return subprocess.call(
+        ["which", "xdotool"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+
+def get_focus_window() -> str | None:
+    if not _has_xdotool():
+        return None
+    try:
+        out = subprocess.check_output(
+            ["xdotool", "getwindowfocus"], text=True, timeout=1).strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _window_looks_like_ime(wid: str) -> bool:
+    if not wid:
+        return True
+    try:
+        name = subprocess.check_output(
+            ["xdotool", "getwindowname", wid], text=True, timeout=1).strip().lower()
+        cls = subprocess.check_output(
+            ["xdotool", "getwindowclassname", wid], text=True, timeout=1).strip().lower()
+        blob = name + " " + cls
+        return any(k in blob for k in ("fcitx", "kimpanel", "ibus", "灵犀语音"))
+    except Exception:
+        return False
+
+
+def resolve_target_window(preferred: str | None = None) -> str | None:
+    env = os.environ.get("PRISIR_VOICE_TARGET_WID", "").strip()
+    for cand in (preferred, env, get_focus_window()):
+        if cand and not _window_looks_like_ime(cand):
+            return cand
+    return None
+
+
+def inject_text(text: str, target_wid: str | None) -> str:
+    try:
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        cb.set_text(text, -1)
+        cb.store()
+        time.sleep(0.05)
+    except Exception as e:
+        return f"剪贴板失败: {e}"
+
+    if not _has_xdotool():
+        return "已复制（无 xdotool，无法自动上屏）"
+
+    try:
+        wid = resolve_target_window(target_wid)
+        if wid:
+            subprocess.run(
+                ["xdotool", "windowactivate", "--sync", wid],
+                check=False, timeout=2,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.1)
+        else:
+            time.sleep(0.12)
+        subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+            check=False, timeout=2,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "已上屏"
+    except Exception as e:
+        return f"已复制；上屏失败: {e}"
+
+
+def _has_speech(pcm, threshold=0.01) -> bool:
+    import numpy as np
+    if len(pcm) == 0:
+        return False
+    return float(np.sqrt(np.mean(pcm ** 2))) > threshold
+
+
+# ---------- IPC（对齐 Win 命名事件）----------
+
+def _sock_send(cmd: str, timeout: float = 0.8) -> str | None:
+    sp = sock_path()
+    if not sp.exists():
+        return None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(str(sp))
+        s.sendall((cmd.strip() + "\n").encode("utf-8"))
+        data = s.recv(4096).decode("utf-8", "replace").strip()
+        s.close()
+        return data
+    except Exception:
+        return None
+
+
+def _daemon_alive() -> bool:
+    r = _sock_send("ping")
+    return r is not None and r.startswith("ok")
+
+
+def _write_pid():
+    try:
+        pid_path().write_text(str(os.getpid()), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _clear_pid():
+    try:
+        p = pid_path()
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+# ---------- 全局热键（对齐 Win GetAsyncKeyState 轮询）----------
+
+def _pynput_key(hotkey: str):
+    from pynput.keyboard import Key
+    mapping = {
+        "alt_r": Key.alt_r,
+        "alt_l": Key.alt_l,
+        "f1": Key.f1, "f2": Key.f2, "f3": Key.f3, "f4": Key.f4,
+        "f5": Key.f5, "f6": Key.f6, "f7": Key.f7, "f8": Key.f8,
+        "f9": Key.f9, "f10": Key.f10, "f11": Key.f11, "f12": Key.f12,
+    }
+    return mapping.get(hotkey, Key.alt_r)
+
+
+class HotkeyWatcher:
+    """按下沿触发 callback（toggle）。优先 pynput，否则 X11 轮询。"""
+
+    def __init__(self, get_hotkey, on_trigger):
+        self.get_hotkey = get_hotkey  # callable -> str
+        self.on_trigger = on_trigger
+        self._stop = threading.Event()
+        self._listener = None
+        self._thread = None
+        self._mode = "none"
+
+    def start(self):
+        self._stop.clear()
+        try:
+            import pynput  # noqa: F401
+            self._mode = "pynput"
+            self._thread = threading.Thread(target=self._run_pynput, daemon=True)
+        except ImportError:
+            try:
+                from Xlib import display  # noqa: F401
+                self._mode = "x11"
+                self._thread = threading.Thread(target=self._run_x11_poll, daemon=True)
+            except ImportError:
+                self._mode = "none"
+                print("[WARN] 无 pynput/python-xlib，全局热键不可用。pip3 install pynput",
+                      file=sys.stderr)
+                return
+        self._thread.start()
+        print(f"[OK] 全局热键监听已启动 ({self._mode})，当前={self.get_hotkey()}", flush=True)
+
+    def stop(self):
+        self._stop.set()
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+
+    def _fire(self):
+        try:
+            self.on_trigger()
+        except Exception:
+            traceback.print_exc()
+
+    def _run_pynput(self):
+        from pynput import keyboard
+        was_down = False
+
+        def on_press(key):
+            nonlocal was_down
+            target = _pynput_key(self.get_hotkey())
+            if key == target and not was_down:
+                was_down = True
+                self._fire()
+
+        def on_release(key):
+            nonlocal was_down
+            target = _pynput_key(self.get_hotkey())
+            if key == target:
+                was_down = False
+
+        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+            self._listener = listener
+            while not self._stop.is_set():
+                time.sleep(0.05)
+            listener.stop()
+
+    def _run_x11_poll(self):
+        """无 pynput 时：XQueryKeymap 轮询（对齐 Win GetAsyncKeyState）。"""
+        from Xlib import XK, display
+        d = display.Display()
+        keysym_map = {
+            "alt_r": XK.XK_Alt_R, "alt_l": XK.XK_Alt_L,
+            "f1": XK.XK_F1, "f2": XK.XK_F2, "f3": XK.XK_F3, "f4": XK.XK_F4,
+            "f5": XK.XK_F5, "f6": XK.XK_F6, "f7": XK.XK_F7, "f8": XK.XK_F8,
+            "f9": XK.XK_F9, "f10": XK.XK_F10, "f11": XK.XK_F11, "f12": XK.XK_F12,
+        }
+        was_down = False
+        while not self._stop.is_set():
+            try:
+                ks = keysym_map.get(self.get_hotkey(), XK.XK_Alt_R)
+                keycode = d.keysym_to_keycode(ks)
+                keymap = d.query_keymap()
+                # keymap: 32 bytes, bit per keycode
+                down = bool(keymap[keycode // 8] & (1 << (keycode % 8)))
+                if down and not was_down:
+                    was_down = True
+                    self._fire()
+                elif not down and was_down:
+                    was_down = False
+            except Exception:
+                pass
+            time.sleep(0.03)
+
+
+# ---------- UI ----------
+
+class FloatBall(Gtk.Window):
+    """录音中悬浮提示：流式预览 + 可拖动。"""
+
+    def __init__(self, label_provider, on_stop_click=None, on_settings_click=None):
+        Gtk.Window.__init__(self, title="灵犀语音")
+        self.set_default_size(420, 110)
+        self.set_keep_above(True)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_decorated(False)
+        self._on_stop = on_stop_click
+        self._drag = None  # (root_x, root_y, win_x, win_y)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        root.set_border_width(10)
+        self.add(root)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        root.pack_start(row, False, False, 0)
+
+        # 顶栏可拖
+        drag = Gtk.EventBox()
+        drag.set_visible_window(False)
+        drag.connect("button-press-event", self._on_press)
+        drag.connect("button-release-event", self._on_release)
+        drag.connect("motion-notify-event", self._on_motion)
+        drag.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.BUTTON_MOTION_MASK
+        )
+        row.pack_start(drag, True, True, 0)
+
+        drag_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        drag.add(drag_row)
+        self.lamp = Gtk.Label(label="●")
+        drag_row.pack_start(self.lamp, False, False, 0)
+        self.lbl = Gtk.Label(label=label_provider())
+        self.lbl.set_xalign(0)
+        drag_row.pack_start(self.lbl, True, True, 0)
+
+        if on_settings_click:
+            sbtn = Gtk.Button(label="热键")
+            sbtn.connect("clicked", lambda *_: on_settings_click())
+            row.pack_start(sbtn, False, False, 0)
+        if on_stop_click:
+            btn = Gtk.Button(label="停止")
+            btn.connect("clicked", lambda *_: on_stop_click())
+            row.pack_start(btn, False, False, 0)
+
+        # 流式预览正文
+        self.partial = Gtk.Label(label="")
+        self.partial.set_xalign(0)
+        self.partial.set_line_wrap(True)
+        self.partial.set_max_width_chars(48)
+        self.partial.set_selectable(True)
+        root.pack_start(self.partial, True, True, 0)
+
+        cfg = load_cfg()
+        fx, fy = cfg.get("float_x"), cfg.get("float_y")
+        if isinstance(fx, int) and isinstance(fy, int) and fx >= 0 and fy >= 0:
+            self.move(fx, fy)
+        else:
+            self.set_gravity(Gdk.Gravity.NORTH_EAST)
+            self.set_position(Gtk.WindowPosition.NONE)
+            GLib.idle_add(self._place_default)
+
+    def _place_default(self):
+        try:
+            screen = self.get_screen()
+            w = screen.get_width() if screen else 1280
+            self.resize(420, 110)
+            self.move(max(8, w - 440), 48)
+        except Exception:
+            self.set_position(Gtk.WindowPosition.CENTER)
+        return False
+
+    def _on_press(self, _w, event):
+        if event.button != 1:
+            return False
+        # 点在按钮上不拖
+        ox, oy = event.get_root_coords()
+        wx, wy = self.get_position()
+        self._drag = (ox, oy, wx, wy)
+        return True
+
+    def _on_release(self, _w, event):
+        if self._drag is None:
+            return False
+        self._drag = None
+        try:
+            x, y = self.get_position()
+            cfg = load_cfg()
+            cfg["float_x"], cfg["float_y"] = int(x), int(y)
+            save_cfg(cfg)
+        except Exception:
+            pass
+        return True
+
+    def _on_motion(self, _w, event):
+        if self._drag is None:
+            return False
+        ox, oy, wx, wy = self._drag
+        rx, ry = event.get_root_coords()
+        self.move(int(wx + (rx - ox)), int(wy + (ry - oy)))
+        return True
+
+    def set_text(self, text: str, recording: bool = True):
+        self.lbl.set_text(text)
+        self.lamp.set_markup(
+            f'<span foreground="{"#e74c3c" if recording else "#2ecc71"}">●</span>')
+
+    def set_partial(self, text: str):
+        """流式预览：讲话过程中更新。"""
+        t = (text or "").strip()
+        if t:
+            self.partial.set_markup(f'<span size="large">{GLib.markup_escape_text(t)}</span>')
+        else:
+            self.partial.set_text("…")
+
+
+class SettingsWin(Gtk.Window):
+    """热键设置（对齐 Win _open_hotkey_settings）。"""
+
+    def __init__(self, app: "VoiceApp"):
+        Gtk.Window.__init__(self, title="语音热键设置")
+        self.app = app
+        self.set_default_size(360, 220)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("destroy", lambda *_: None)
+
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        v.set_border_width(16)
+        self.add(v)
+
+        cfg = load_cfg()
+        cur = cfg.get("hotkey", DEFAULT_HOTKEY)
+        v.pack_start(Gtk.Label(label="录音/上屏快捷键（按一下开始，再按一下停止并上屏）",
+                               xalign=0), False, False, 0)
+
+        self.btn = Gtk.Button(label=HOTKEY_CHOICES.get(cur, cur))
+        self.btn.set_size_request(-1, 48)
+        self.btn.connect("clicked", self._start_capture)
+        v.pack_start(self.btn, False, False, 0)
+
+        self.hint = Gtk.Label(label="点击上方按钮，然后按下新热键（右 Alt / 左 Alt / F1–F12）",
+                              xalign=0)
+        self.hint.set_line_wrap(True)
+        v.pack_start(self.hint, False, False, 0)
+
+        self.status = Gtk.Label(label="", xalign=0)
+        v.pack_start(self.status, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        close_btn = Gtk.Button(label="关闭")
+        close_btn.connect("clicked", lambda *_: self.destroy())
+        row.pack_end(close_btn, False, False, 0)
+        v.pack_start(row, False, False, 0)
+
+        self._capturing = False
+        self.connect("key-press-event", self._on_key)
+
+    def _start_capture(self, *_):
+        self._capturing = True
+        self.btn.set_label("请按新热键…")
+        self.status.set_text("")
+        self.set_accept_focus(True)
+        self.present()
+
+    def _on_key(self, _w, event):
+        if not self._capturing:
+            return False
+        name = self._event_to_hotkey(event)
+        if not name:
+            self.status.set_text("仅支持：右/左 Alt 与 F1–F12")
+            return True
+        cfg = load_cfg()
+        cfg["hotkey"] = name
+        save_cfg(cfg)
+        self.app.reload_hotkey()
+        self.btn.set_label(HOTKEY_CHOICES[name])
+        self.status.set_text(f"已设置为 {HOTKEY_CHOICES[name]}，立即生效")
+        self._capturing = False
+        return True
+
+    @staticmethod
+    def _event_to_hotkey(event) -> str | None:
+        kv = event.keyval
+        # Alt_R / Alt_L / Meta variants
+        if kv in (Gdk.KEY_Alt_R, Gdk.KEY_Meta_R, Gdk.KEY_ISO_Level3_Shift):
+            return "alt_r"
+        if kv in (Gdk.KEY_Alt_L, Gdk.KEY_Meta_L):
+            return "alt_l"
+        for i in range(1, 13):
+            if kv == getattr(Gdk, f"KEY_F{i}", None):
+                return f"f{i}"
+        return None
+
+
+class VoiceApp:
+    """常驻语音服务：热键 + socket IPC + 录音上屏。"""
+
+    # 流式预览：每隔多久对「已录片段」跑一次识别（伪流式；SenseVoice 本身非整句流式模型）
+    PARTIAL_INTERVAL = 1.1
+    PARTIAL_MIN_SEC = 0.7
+
+    def __init__(self):
+        self.asr = SenseVoice()
+        self.rec = Recorder()
+        self.status = "ready"  # ready | recording | busy
+        self.target_wid: str | None = None
+        self._busy = False
+        self._cfg = load_cfg()
+        self._float: FloatBall | None = None
+        self._settings: SettingsWin | None = None
+        self._quit = False
+        self._hotkey = HotkeyWatcher(lambda: self._cfg.get("hotkey", DEFAULT_HOTKEY),
+                                     lambda: GLib.idle_add(self.toggle))
+        self._server = None
+        self._partial_stop = threading.Event()
+        self._partial_thread: threading.Thread | None = None
+        self._partial_text = ""
+        self._partial_busy = False
+
+    def reload_hotkey(self):
+        self._cfg = load_cfg()
+        # pynput/x11 轮询每次读 get_hotkey()，无需重启 listener
+        print(f"[OK] 热键已切换为 {self._cfg.get('hotkey')}", flush=True)
+
+    def hotkey_name(self) -> str:
+        k = self._cfg.get("hotkey", DEFAULT_HOTKEY)
+        return HOTKEY_CHOICES.get(k, k)
+
+    def start_services(self):
+        # 先开 socket，避免「模型加载中菜单无响应」
+        self._start_socket()
+        _write_pid()
+        self._hotkey.start()
+
+        def load_model():
+            miss = _deps_missing()
+            if miss:
+                print("[ERROR] 缺少依赖: " + ", ".join(miss), file=sys.stderr)
+                return
+            ok, msg = self.asr.load()
+            print(f"[{'OK' if ok else 'ERROR'}] {msg}", flush=True)
+
+        threading.Thread(target=load_model, daemon=True).start()
+
+    def _start_socket(self):
+        sp = sock_path()
+        try:
+            if sp.exists():
+                sp.unlink()
+        except Exception:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(sp))
+        srv.listen(4)
+        srv.settimeout(0.5)
+        self._server = srv
+
+        def loop():
+            while not self._quit:
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    if self._quit:
+                        break
+                    continue
+                try:
+                    data = conn.recv(1024).decode("utf-8", "replace").strip().lower()
+                    resp = self._handle_cmd(data)
+                    conn.sendall((resp + "\n").encode("utf-8"))
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def _handle_cmd(self, cmd: str) -> str:
+        if cmd in ("ping", "start", "daemon"):
+            return f"ok status={self.status} hotkey={self._cfg.get('hotkey')}"
+        if cmd == "toggle":
+            GLib.idle_add(self.toggle)
+            return "ok toggle"
+        if cmd == "settings":
+            GLib.idle_add(self.open_settings)
+            return "ok settings"
+        if cmd == "quit":
+            GLib.idle_add(self.shutdown)
+            return "ok quit"
+        if cmd == "status":
+            return json.dumps({
+                "status": self.status,
+                "hotkey": self._cfg.get("hotkey"),
+                "hotkey_name": self.hotkey_name(),
+            }, ensure_ascii=False)
+        return "err unknown"
+
+    def open_settings(self):
+        if self._settings:
+            try:
+                self._settings.present()
+                return
+            except Exception:
+                self._settings = None
+        self._settings = SettingsWin(self)
+        self._settings.connect("destroy", lambda *_: setattr(self, "_settings", None))
+        self._settings.show_all()
+
+    def toggle(self):
+        if self._busy:
+            return False
+        if self.status == "ready":
+            self.target_wid = resolve_target_window(get_focus_window())
+            try:
+                self.rec.start()
+            except Exception as e:
+                self._toast(f"无法打开麦克风: {e}")
+                return False
+            self.status = "recording"
+            self._partial_text = ""
+            self._show_float(f"录音中（流式预览）· 再按 {self.hotkey_name()} 上屏")
+            if self._float:
+                self._float.set_partial("")
+            self._start_partial_loop()
+        elif self.status == "recording":
+            self._stop_and_commit()
+        return False
+
+    def _start_partial_loop(self):
+        self._stop_partial_loop()
+        self._partial_stop.clear()
+
+        def loop():
+            while not self._partial_stop.is_set() and self.status == "recording":
+                if self._partial_busy:
+                    time.sleep(0.15)
+                    continue
+                pcm = self.rec.snapshot()
+                if len(pcm) < SAMPLE_RATE * self.PARTIAL_MIN_SEC or not _has_speech(pcm):
+                    self._partial_stop.wait(self.PARTIAL_INTERVAL)
+                    continue
+                self._partial_busy = True
+                try:
+                    text = self.asr.transcribe(pcm)
+                except Exception as e:
+                    print(f"[WARN] partial: {e}", flush=True)
+                    text = ""
+                finally:
+                    self._partial_busy = False
+                if self._partial_stop.is_set() or self.status != "recording":
+                    break
+                if text and text != self._partial_text:
+                    self._partial_text = text
+
+                    def ui(t=text):
+                        if self.status == "recording" and self._float:
+                            self._float.set_partial(t)
+                        return False
+
+                    GLib.idle_add(ui)
+                self._partial_stop.wait(self.PARTIAL_INTERVAL)
+
+        self._partial_thread = threading.Thread(target=loop, daemon=True)
+        self._partial_thread.start()
+
+    def _stop_partial_loop(self):
+        self._partial_stop.set()
+        t = self._partial_thread
+        self._partial_thread = None
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=0.2)
+
+    def _show_float(self, text: str):
+        if self._float is None:
+            self._float = FloatBall(
+                lambda: text,
+                on_stop_click=lambda: self.toggle(),
+                on_settings_click=lambda: self.open_settings(),
+            )
+            self._float.show_all()
+        else:
+            self._float.set_text(text, recording=True)
+            self._float.show_all()
+
+    def _hide_float(self):
+        if self._float:
+            try:
+                self._float.hide()
+            except Exception:
+                pass
+
+    def _toast(self, msg: str):
+        # 短暂浮窗提示
+        self._show_float(msg)
+        if self._float:
+            self._float.set_text(msg, recording=False)
+            self._float.set_partial("")
+        GLib.timeout_add(1200, lambda: (self._hide_float(), False)[1])
+
+    def _stop_and_commit(self):
+        self._busy = True
+        self.status = "busy"
+        self._stop_partial_loop()
+        if self._float:
+            tip = self._partial_text or "识别中…"
+            self._float.set_text("定稿识别中…", recording=False)
+            if self._partial_text:
+                self._float.set_partial(self._partial_text)
+        pcm = self.rec.stop()
+
+        def work():
+            err = ""
+            text = ""
+            try:
+                if len(pcm) < SAMPLE_RATE * 0.35:
+                    err = "录音太短"
+                elif not _has_speech(pcm):
+                    err = "未检测到语音"
+                else:
+                    text = self.asr.transcribe(pcm)
+                    if not text:
+                        # 定稿失败时回退用最后一次流式结果
+                        text = self._partial_text
+                    if not text:
+                        err = "未识别到内容"
+            except Exception as e:
+                err = str(e)
+
+            def ui():
+                self._busy = False
+                self.status = "ready"
+                self._hide_float()
+                if err:
+                    self._toast(err)
+                    return
+                msg = inject_text(text, self.target_wid)
+                print(f"[OK] inject {text!r} ({msg})", flush=True)
+            GLib.idle_add(ui)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def shutdown(self):
+        self._quit = True
+        self._hotkey.stop()
+        try:
+            if self._server:
+                self._server.close()
+        except Exception:
+            pass
+        try:
+            sp = sock_path()
+            if sp.exists():
+                sp.unlink()
+        except Exception:
+            pass
+        _clear_pid()
+        Gtk.main_quit()
+        return False
+
+
+def _spawn_daemon() -> None:
+    env = _ensure_display_env()
+    log_path = Path(env.get("XDG_RUNTIME_DIR") or "/tmp") / "prisir_voice_daemon.log"
+    argv = [sys.executable, "-u", str(Path(__file__).resolve()), "--daemon"]
+    try:
+        logf = open(log_path, "ab", buffering=0)
+    except Exception:
+        logf = subprocess.DEVNULL
+    subprocess.Popen(
+        argv, env=env,
+        stdout=logf, stderr=logf,
+        start_new_session=True,
+    )
+
+
+def _ensure_daemon_and_send(cmd: str) -> int:
+    """客户端：若 daemon 未起则拉起，再发命令。"""
+    if _daemon_alive():
+        r = _sock_send(cmd)
+        print(r or "err", flush=True)
+        return 0 if r and r.startswith("ok") else 1
+
+    _spawn_daemon()
+    # 等 socket 就绪（模型加载可到十余秒）
+    for _ in range(200):
+        time.sleep(0.1)
+        if _daemon_alive():
+            break
+    else:
+        print("err daemon_start_timeout", file=sys.stderr)
+        return 1
+    # --daemon-only：只拉起，不 toggle
+    if cmd in ("", "start", "daemon"):
+        print("ok started", flush=True)
+        return 0
+    r = _sock_send(cmd)
+    print(r or "err", flush=True)
+    return 0 if r and r.startswith("ok") else 1
+
+
+def _acquire_daemon_lock():
+    """文件锁防双开（systemd + fcitx --start 可能同时拉起）。"""
+    import fcntl
+    lock_path = _runtime_dir() / "prisir_voice.lock"
+    fp = open(lock_path, "w")
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fp.close()
+        return None
+    fp.write(str(os.getpid()))
+    fp.flush()
+    return fp
+
+
+def run_daemon():
+    # 补环境后再进 GTK
+    os.environ.update(_ensure_display_env())
+    if _daemon_alive():
+        print("[INFO] daemon already running", flush=True)
+        return 0
+    lock_fp = _acquire_daemon_lock()
+    if lock_fp is None:
+        # 另一实例正在启动；稍等 socket
+        for _ in range(50):
+            time.sleep(0.1)
+            if _daemon_alive():
+                print("[INFO] daemon already running", flush=True)
+                return 0
+        print("[WARN] lock busy but no socket; exiting", flush=True)
+        return 1
+    app = VoiceApp()
+    app.start_services()
+    GLib.timeout_add(1000, lambda: not app._quit)
+    print(f"[OK] prisir_voice daemon 就绪 · 热键={app.hotkey_name()} · socket={sock_path()}",
+          flush=True)
+    try:
+        Gtk.main()
+    finally:
+        try:
+            lock_fp.close()
+        except Exception:
+            pass
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="灵犀语音听写（Linux）")
+    p.add_argument("--daemon", action="store_true", help="前台常驻（热键+IPC）")
+    p.add_argument("--start", action="store_true", help="仅确保 daemon 在跑（开机自启用）")
+    p.add_argument("--toggle", action="store_true", help="向 daemon 发 toggle（默认）")
+    p.add_argument("--settings", action="store_true", help="打开热键设置")
+    p.add_argument("--quit", action="store_true", help="退出 daemon")
+    p.add_argument("--status", action="store_true", help="查询状态")
+    args = p.parse_args(argv)
+
+    if args.daemon:
+        return run_daemon()
+    if args.start:
+        return _ensure_daemon_and_send("start")
+    if args.settings:
+        return _ensure_daemon_and_send("settings")
+    if args.quit:
+        r = _sock_send("quit")
+        print(r or "not_running", flush=True)
+        return 0
+    if args.status:
+        r = _sock_send("status") or _sock_send("ping")
+        print(r or "not_running", flush=True)
+        return 0 if r else 1
+    # 默认：菜单点击 → toggle（对齐 Win VoiceToggle 事件）
+    return _ensure_daemon_and_send("toggle")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)

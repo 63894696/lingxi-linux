@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""灵犀拼音 Linux 开放 API — 对齐 Win/Android（127.0.0.1:23331）。
+
+用途：供本机 AI Agent 定制个性化输入法。
+默认关闭；配置 ~/.config/prisir/open_api.json。
+
+端点：
+  GET  / /health /status
+  POST /rpc  JSON-RPC
+
+方法（对齐 Win/Android + Linux 引擎扩展）：
+  version | status | query | open_api.get | open_api.set
+  learn | classify | sentences | to_script | punct | punct_reset | script
+
+启动：
+  prisir_openapi                 # enabled=true 才监听；否则退出 0
+  prisir_openapi --force         # 无视 enabled，前台冒烟
+  prisir_openapi --daemon        # 后台（需 enabled 或配合 --force）
+  prisir_openapi --start         # 若 enabled 则确保在跑（开机/fcitx 用）
+  prisir_openapi --stop          # 停止监听进程
+  prisir_openapi --status        # 打印配置与监听状态
+"""
+from __future__ import annotations
+
+import argparse
+import atexit
+import ctypes
+import fcntl
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+DEFAULT_PORT = 23331
+DEFAULT_BIND = "127.0.0.1"
+PURPOSE = (
+    "开放 API 供本机 AI Agent 接入，按用户习惯协助定制个性化输入法"
+    "（查询、学习、简繁、配置等）。默认关闭；仅监听 127.0.0.1。"
+)
+PURPOSE_ZH = PURPOSE
+
+CFG_DIR = Path.home() / ".config" / "prisir"
+CFG_PATH = CFG_DIR / "open_api.json"
+ENGINE_SO = os.environ.get("PRISIR_IME_SO", "/usr/lib/fcitx5/prisir/libprisir_ime.so")
+ENGINE_DB = os.environ.get("PRISIR_IME_DB", "/usr/lib/fcitx5/prisir/ciku.db")
+
+
+def _runtime_dir() -> Path:
+    d = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/prisir-{os.getuid()}")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        d = Path(f"/tmp/prisir-{os.getuid()}")
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def lock_path() -> Path:
+    return _runtime_dir() / "prisir_openapi.lock"
+
+
+def pid_path() -> Path:
+    return _runtime_dir() / "prisir_openapi.pid"
+
+
+def load_cfg() -> dict:
+    cfg = {"enabled": False, "port": DEFAULT_PORT, "bind": DEFAULT_BIND}
+    if CFG_PATH.exists():
+        try:
+            data = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg.update(data)
+        except Exception:
+            pass
+    cfg["bind"] = DEFAULT_BIND
+    try:
+        cfg["port"] = int(cfg.get("port") or DEFAULT_PORT)
+    except (TypeError, ValueError):
+        cfg["port"] = DEFAULT_PORT
+    if not (1 <= cfg["port"] <= 65535):
+        cfg["port"] = DEFAULT_PORT
+    cfg["enabled"] = bool(cfg.get("enabled"))
+    return cfg
+
+
+def save_cfg(cfg: dict) -> dict:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    out = {
+        "enabled": bool(cfg.get("enabled")),
+        "port": int(cfg.get("port") or DEFAULT_PORT),
+        "bind": DEFAULT_BIND,
+    }
+    CFG_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return out
+
+
+class Engine:
+    def __init__(self):
+        self.lib = None
+        self.handle = None
+        self._lock = threading.Lock()
+        self._loaded = False
+        self._error = ""
+
+    def open(self) -> None:
+        if self.handle:
+            return
+        lib = ctypes.CDLL(ENGINE_SO)
+        lib.prisir_ime_load.restype = ctypes.c_void_p
+        lib.prisir_ime_load.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.prisir_ime_free.argtypes = [ctypes.c_void_p]
+        lib.prisir_ime_query.restype = ctypes.c_void_p
+        lib.prisir_ime_query.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.prisir_ime_free_string.argtypes = [ctypes.c_void_p]
+        lib.prisir_ime_learn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+        lib.prisir_ime_classify.restype = ctypes.c_int
+        lib.prisir_ime_classify.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.prisir_ime_sentences.restype = ctypes.c_void_p
+        lib.prisir_ime_sentences.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        lib.prisir_ime_to_script.restype = ctypes.c_void_p
+        lib.prisir_ime_to_script.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.prisir_ime_punct.restype = ctypes.c_void_p
+        lib.prisir_ime_punct.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int]
+        lib.prisir_ime_punct_reset.argtypes = [ctypes.c_void_p]
+        lib.prisir_ime_script.restype = ctypes.c_int
+        lib.prisir_ime_script.argtypes = [ctypes.c_void_p]
+        lib.prisir_ime_set_script.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.prisir_ime_cycle_script.restype = ctypes.c_int
+        lib.prisir_ime_cycle_script.argtypes = [ctypes.c_void_p]
+        if hasattr(lib, "prisir_ime_abi_version"):
+            lib.prisir_ime_abi_version.restype = ctypes.c_int
+        h = lib.prisir_ime_load(ENGINE_DB.encode(), 0)
+        if not h:
+            raise RuntimeError(f"prisir_ime_load failed: {ENGINE_DB}")
+        self.lib = lib
+        self.handle = h
+        self._loaded = True
+
+    def _take_str(self, ptr) -> str:
+        if not ptr:
+            return ""
+        raw = ctypes.string_at(ptr).decode("utf-8", "replace")
+        self.lib.prisir_ime_free_string(ptr)
+        return raw
+
+    def query_raw(self, pinyin: str):
+        """对齐 Win：candidates 为引擎 JSON 原样（[{word,weight},...]）。"""
+        self.open()
+        with self._lock:
+            ptr = self.lib.prisir_ime_query(self.handle, pinyin.encode("utf-8"))
+            raw = self._take_str(ptr)
+        try:
+            data = json.loads(raw) if raw else []
+        except json.JSONDecodeError:
+            data = []
+        return data if isinstance(data, list) else [data]
+
+    def learn(self, pinyin: str, word: str) -> None:
+        self.open()
+        with self._lock:
+            self.lib.prisir_ime_learn(
+                self.handle, pinyin.encode("utf-8"), word.encode("utf-8"))
+
+    def classify(self, text: str) -> int:
+        self.open()
+        with self._lock:
+            return int(self.lib.prisir_ime_classify(self.handle, text.encode("utf-8")))
+
+    def sentences(self, text: str, k: int = 3, min_words: int = 2) -> list:
+        self.open()
+        with self._lock:
+            ptr = self.lib.prisir_ime_sentences(
+                self.handle, text.encode("utf-8"), int(k), int(min_words))
+            raw = self._take_str(ptr)
+        try:
+            data = json.loads(raw) if raw else []
+        except json.JSONDecodeError:
+            data = []
+        return data if isinstance(data, list) else []
+
+    def to_script(self, text: str) -> str:
+        self.open()
+        with self._lock:
+            ptr = self.lib.prisir_ime_to_script(self.handle, text.encode("utf-8"))
+            return self._take_str(ptr)
+
+    def punct(self, ch: str, reset: bool = False) -> str | None:
+        self.open()
+        if not ch:
+            return None
+        cp = ord(ch[0])
+        with self._lock:
+            ptr = self.lib.prisir_ime_punct(self.handle, cp, 1 if reset else 0)
+            if not ptr:
+                return None
+            return self._take_str(ptr)
+
+    def punct_reset(self) -> None:
+        self.open()
+        with self._lock:
+            self.lib.prisir_ime_punct_reset(self.handle)
+
+    def script(self) -> int:
+        self.open()
+        with self._lock:
+            return int(self.lib.prisir_ime_script(self.handle))
+
+    def set_script(self, mode: int) -> int:
+        self.open()
+        with self._lock:
+            self.lib.prisir_ime_set_script(self.handle, int(mode))
+            return int(self.lib.prisir_ime_script(self.handle))
+
+    def cycle_script(self) -> int:
+        self.open()
+        with self._lock:
+            return int(self.lib.prisir_ime_cycle_script(self.handle))
+
+    def abi(self) -> int:
+        self.open()
+        if hasattr(self.lib, "prisir_ime_abi_version"):
+            return int(self.lib.prisir_ime_abi_version())
+        return 0
+
+
+ENGINE = Engine()
+STATE = {"listening": False, "port": 0, "stop": False}
+_HTTPD: ThreadingHTTPServer | None = None
+_LOCK_FP = None
+
+
+def rpc(body: str) -> dict:
+    try:
+        req = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+    rid = req.get("id")
+    method = req.get("method") or ""
+    params = req.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+
+    def ok(result):
+        return {"jsonrpc": "2.0", "id": rid, "result": result}
+
+    def err(code, msg):
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
+
+    try:
+        if method == "version":
+            return ok({
+                "ime": "fcitx5-prisir",
+                "platform": "linux",
+                "service": "prisir-ime-open-api",
+                "abi": ENGINE.abi(),
+                "engine_loaded": ENGINE._loaded,
+            })
+        if method == "status":
+            cfg = load_cfg()
+            return ok({
+                "platform": "linux",
+                "ime": "fcitx5-prisir",
+                "open_api": {
+                    **cfg,
+                    "listening": STATE["listening"],
+                    "active_port": STATE["port"],
+                    "config_path": str(CFG_PATH),
+                },
+                "listening": STATE["listening"],
+                "port": STATE["port"],
+                "engine_loaded": ENGINE._loaded,
+                "purpose": PURPOSE,
+                "purpose_zh": PURPOSE_ZH,
+                "pid": os.getpid(),
+            })
+        if method == "query":
+            py = str(params.get("pinyin") or params.get("input") or "")
+            if not py:
+                return err(-32602, "params.pinyin required")
+            cands = ENGINE.query_raw(py)
+            return ok({"pinyin": py, "candidates": cands})
+        if method == "learn":
+            py = str(params.get("pinyin") or params.get("input") or "")
+            word = str(params.get("word") or params.get("selected") or "")
+            if not py or not word:
+                return err(-32602, "params.pinyin and params.word required")
+            ENGINE.learn(py, word)
+            return ok({"pinyin": py, "word": word, "learned": True})
+        if method == "classify":
+            text = str(params.get("input") or params.get("pinyin") or params.get("text") or "")
+            if not text:
+                return err(-32602, "params.input required")
+            kind = ENGINE.classify(text)
+            names = {0: "empty", 1: "pinyin", 2: "english", 3: "ambiguous"}
+            return ok({"input": text, "kind": kind, "kind_name": names.get(kind, "unknown")})
+        if method == "sentences":
+            text = str(params.get("input") or params.get("pinyin") or "")
+            if not text:
+                return err(-32602, "params.input required")
+            k = int(params.get("k") or params.get("limit") or 3)
+            min_words = int(params.get("min_words") or 2)
+            return ok({
+                "input": text,
+                "sentences": ENGINE.sentences(text, k, min_words),
+            })
+        if method == "to_script":
+            text = str(params.get("text") or params.get("input") or "")
+            return ok({"text": text, "result": ENGINE.to_script(text)})
+        if method == "punct":
+            ch = str(params.get("char") or params.get("ch") or "")
+            reset = bool(params.get("reset"))
+            mapped = ENGINE.punct(ch, reset=reset)
+            return ok({"char": ch, "mapped": mapped, "passthrough": mapped is None})
+        if method == "punct_reset":
+            ENGINE.punct_reset()
+            return ok({"reset": True})
+        if method == "script":
+            # get / set / cycle
+            if "mode" in params:
+                mode = int(params["mode"])
+                return ok({"mode": ENGINE.set_script(mode)})
+            if params.get("cycle"):
+                return ok({"mode": ENGINE.cycle_script()})
+            return ok({"mode": ENGINE.script()})
+        if method == "open_api.get":
+            cfg = load_cfg()
+            return ok({
+                **cfg,
+                "listening": STATE["listening"],
+                "active_port": STATE["port"],
+                "config_path": str(CFG_PATH),
+            })
+        if method == "open_api.set":
+            cfg = load_cfg()
+            if "enabled" in params:
+                cfg["enabled"] = bool(params["enabled"])
+            if "port" in params:
+                try:
+                    port = int(params["port"])
+                except (TypeError, ValueError):
+                    return err(-32602, "invalid port")
+                if not (1 <= port <= 65535):
+                    return err(-32602, "port out of range")
+                cfg["port"] = port
+            cfg = save_cfg(cfg)
+            # 运行时启停（对齐 Win rpc_set）
+            if cfg["enabled"]:
+                if not STATE["listening"]:
+                    # 已在本进程内：由 serve 循环负责；若未听则标记需外拉
+                    pass
+            else:
+                # 关闭：保存后请求退出，由外层重启策略处理
+                STATE["stop"] = True
+                threading.Thread(target=_stop_httpd_soon, daemon=True).start()
+            return ok({
+                **cfg,
+                "listening": STATE["listening"],
+                "active_port": STATE["port"],
+                "config_path": str(CFG_PATH),
+                "note": "disabled → process will stop; enable via UI/--start" if not cfg["enabled"] else "",
+            })
+        return err(-32601, f"method not found: {method}")
+    except Exception as e:
+        return err(-32000, str(e))
+
+
+def _stop_httpd_soon():
+    time.sleep(0.05)
+    global _HTTPD
+    if _HTTPD:
+        try:
+            _HTTPD.shutdown()
+        except Exception:
+            pass
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[openapi] " + (fmt % args) + "\n")
+
+    def _send(self, code: int, obj, content_type="application/json; charset=utf-8"):
+        if obj is None:
+            raw = b""
+        elif isinstance(obj, (bytes, bytearray)):
+            raw = bytes(obj)
+        else:
+            raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Connection", "close")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if raw:
+            self.wfile.write(raw)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        cfg = load_cfg()
+        if path in ("/", ""):
+            self._send(200, {
+                "name": "lingxi-openapi",
+                "service": "prisir-ime-open-api",
+                "platform": "linux",
+                "purpose": PURPOSE,
+                "purpose_zh": PURPOSE_ZH,
+                "endpoints": ["GET /health", "GET /status", "POST /rpc"],
+                "methods": [
+                    "version", "status", "query", "open_api.get", "open_api.set",
+                    "learn", "classify", "sentences", "to_script", "punct",
+                    "punct_reset", "script",
+                ],
+                "default_off": True,
+                "bind": f"{cfg.get('bind', DEFAULT_BIND)}:{cfg.get('port', DEFAULT_PORT)}",
+                "docs": "POST /rpc with JSON-RPC body",
+            })
+        elif path == "/health":
+            self._send(200, {
+                "ok": True,
+                "service": "prisir-ime-open-api",
+                "platform": "linux",
+                "listening": STATE["listening"],
+                "port": STATE["port"],
+                "bind": DEFAULT_BIND,
+                "purpose": PURPOSE,
+                "purpose_zh": PURPOSE_ZH,
+            })
+        elif path == "/status":
+            self._send(200, {
+                "ok": True,
+                "platform": "linux",
+                "open_api": {
+                    **cfg,
+                    "listening": STATE["listening"],
+                    "active_port": STATE["port"],
+                    "config_path": str(CFG_PATH),
+                },
+                "engine_loaded": ENGINE._loaded,
+                "listening": STATE["listening"],
+                "port": STATE["port"],
+                "purpose": PURPOSE,
+            })
+        else:
+            self._send(404, {"error": "not found", "path": path})
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(min(n, 256 * 1024)).decode("utf-8", "replace") if n else ""
+        if path == "/rpc":
+            self._send(200, rpc(body.strip()))
+        else:
+            self._send(404, {"error": "not found", "path": path})
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _clear_stale_lock() -> None:
+    """进程已死但 lock/pid 残留时清掉，否则 --start 会误报 lock busy。"""
+    pp = pid_path()
+    lp = lock_path()
+    stale = False
+    try:
+        if pp.exists():
+            pid = int(pp.read_text().strip() or "0")
+            if not _pid_alive(pid):
+                stale = True
+        elif lp.exists() and not health_probe(int(load_cfg().get("port") or DEFAULT_PORT)):
+            stale = True
+    except Exception:
+        stale = True
+    if stale:
+        for p in (pp, lp):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+
+def _acquire_lock():
+    global _LOCK_FP
+    _clear_stale_lock()
+    fp = open(lock_path(), "w")
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fp.close()
+        # 再清一次并重试（stop 刚杀进程时锁可能瞬时残留）
+        _clear_stale_lock()
+        fp = open(lock_path(), "w")
+        try:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fp.close()
+            return False
+    fp.write(str(os.getpid()))
+    fp.flush()
+    _LOCK_FP = fp
+    try:
+        pid_path().write_text(str(os.getpid()), encoding="utf-8")
+    except Exception:
+        pass
+    return True
+
+
+def _release_lock():
+    global _LOCK_FP
+    try:
+        if _LOCK_FP:
+            _LOCK_FP.close()
+            _LOCK_FP = None
+    except Exception:
+        pass
+    for p in (pid_path(), lock_path()):
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+
+def health_probe(port: int, timeout: float = 0.4) -> bool:
+    try:
+        with socket.create_connection((DEFAULT_BIND, port), timeout=timeout) as s:
+            s.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            data = s.recv(512)
+            return b'"ok"' in data or b"200" in data
+    except Exception:
+        return False
+
+
+def serve(bind: str, port: int) -> None:
+    global _HTTPD
+    httpd = ThreadingHTTPServer((bind, port), Handler)
+    _HTTPD = httpd
+    STATE["listening"] = True
+    STATE["port"] = httpd.server_address[1]
+    print(f"[openapi] listening http://{bind}:{STATE['port']}/", flush=True)
+    print("[openapi] endpoints: GET /health  GET /status  POST /rpc", flush=True)
+    try:
+        while not STATE["stop"]:
+            httpd.handle_request()
+            # handle_request is blocking one; use timeout
+            httpd.timeout = 0.5
+    finally:
+        STATE["listening"] = False
+        STATE["port"] = 0
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+        _HTTPD = None
+        print("[openapi] stopped", flush=True)
+
+
+def serve_forever(bind: str, port: int) -> None:
+    """标准 serve_forever；open_api.set(enabled=false) 时 shutdown。"""
+    global _HTTPD
+    httpd = ThreadingHTTPServer((bind, port), Handler)
+    httpd.daemon_threads = True
+    _HTTPD = httpd
+    STATE["listening"] = True
+    STATE["port"] = httpd.server_address[1]
+    print(f"[openapi] listening http://{bind}:{STATE['port']}/", flush=True)
+    print("[openapi] endpoints: GET /health  GET /status  POST /rpc", flush=True)
+    try:
+        httpd.serve_forever(poll_interval=0.5)
+    finally:
+        STATE["listening"] = False
+        STATE["port"] = 0
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+        _HTTPD = None
+        print("[openapi] stopped", flush=True)
+
+
+def _daemonize() -> None:
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    sys.stdin.close()
+
+
+def run_server(force: bool = False) -> int:
+    cfg = load_cfg()
+    if not force and not cfg.get("enabled"):
+        print("[openapi] disabled (enable via prisir_openapi_ui or open_api.set)", flush=True)
+        return 0
+    if not _acquire_lock():
+        # 已有实例
+        if health_probe(int(cfg.get("port") or DEFAULT_PORT)):
+            print("[openapi] already listening", flush=True)
+            return 0
+        print("[openapi] lock busy", flush=True)
+        return 1
+    atexit.register(_release_lock)
+    bind = DEFAULT_BIND
+    port = int(cfg.get("port") or DEFAULT_PORT)
+    try:
+        ENGINE.open()
+        print(f"[openapi] engine ok abi={ENGINE.abi()}", flush=True)
+    except Exception as e:
+        print(f"[openapi] engine warn: {e}", flush=True)
+    try:
+        serve_forever(bind, port)
+    except OSError as e:
+        print(f"[openapi] bind failed: {e}", flush=True)
+        return 1
+    return 0
+
+
+def _spawn_daemon(force: bool = False) -> None:
+    argv = [sys.executable, "-u", str(Path(__file__).resolve()), "--daemon"]
+    if force:
+        argv.append("--force")
+    log = _runtime_dir() / "prisir_openapi.log"
+    try:
+        logf = open(log, "ab", buffering=0)
+    except Exception:
+        logf = subprocess.DEVNULL
+    subprocess.Popen(argv, stdout=logf, stderr=logf, start_new_session=True)
+
+
+def cmd_start() -> int:
+    cfg = load_cfg()
+    if not cfg.get("enabled"):
+        print("[openapi] disabled — skip start", flush=True)
+        return 0
+    port = int(cfg.get("port") or DEFAULT_PORT)
+    if health_probe(port):
+        print(f"[openapi] already up :{port}", flush=True)
+        return 0
+    _clear_stale_lock()
+    _spawn_daemon(force=False)
+    for _ in range(50):
+        time.sleep(0.1)
+        if health_probe(port):
+            print(f"[openapi] started :{port}", flush=True)
+            return 0
+    print("[openapi] start timeout", file=sys.stderr)
+    return 1
+
+
+def _kill_daemon_only() -> bool:
+    """只杀开放 API 服务进程，绝不误杀 prisir_openapi_ui 设置页。"""
+    killed = False
+    # 1) pid 文件
+    try:
+        if pid_path().exists():
+            pid = int(pid_path().read_text().strip() or "0")
+            if pid > 0 and _pid_alive(pid):
+                os.kill(pid, signal.SIGTERM)
+                killed = True
+    except Exception:
+        pass
+    # 2) 精确匹配 daemon 命令行（排除 *_ui）
+    try:
+        out = subprocess.check_output(["pgrep", "-af", "prisir_openapi"], text=True)
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        if "prisir_openapi_ui" in line:
+            continue
+        if "prisir_openapi" not in line:
+            continue
+        # 只杀 --daemon / 无 --start/--stop/--status 的服务进程
+        if "--daemon" in line or (
+            "prisir_openapi" in line
+            and "--start" not in line
+            and "--stop" not in line
+            and "--status" not in line
+            and "openapi_ui" not in line
+            and "bash" not in line
+            and "pgrep" not in line
+        ):
+            try:
+                pid = int(line.split(None, 1)[0])
+                if pid != os.getpid():
+                    os.kill(pid, signal.SIGTERM)
+                    killed = True
+            except Exception:
+                pass
+    return killed
+
+
+def cmd_stop() -> int:
+    cfg = load_cfg()
+    port = int(cfg.get("port") or DEFAULT_PORT)
+    killed = _kill_daemon_only()
+    time.sleep(0.35)
+    # 仍在听则再强杀一次
+    if health_probe(port):
+        _kill_daemon_only()
+        time.sleep(0.2)
+    _clear_stale_lock()
+    _release_lock()
+    up = health_probe(port)
+    print("[openapi] stopped" if killed or not up else "[openapi] stop attempted", flush=True)
+    return 0 if not up else 1
+
+
+def cmd_status() -> int:
+    cfg = load_cfg()
+    port = int(cfg.get("port") or DEFAULT_PORT)
+    up = health_probe(port)
+    print(json.dumps({
+        "enabled": cfg.get("enabled"),
+        "port": port,
+        "bind": DEFAULT_BIND,
+        "listening": up,
+        "config_path": str(CFG_PATH),
+    }, ensure_ascii=False))
+    return 0 if up or not cfg.get("enabled") else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--force", action="store_true", help="ignore enabled flag")
+    ap.add_argument("--daemon", action="store_true")
+    ap.add_argument("--start", action="store_true", help="ensure running if enabled")
+    ap.add_argument("--stop", action="store_true")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--port", type=int, default=0)
+    args = ap.parse_args()
+
+    if args.status:
+        return cmd_status()
+    if args.stop:
+        return cmd_stop()
+    if args.start:
+        return cmd_start()
+
+    if args.port:
+        cfg = load_cfg()
+        cfg["port"] = args.port
+        save_cfg(cfg)
+
+    if args.daemon:
+        # 双 fork 后台；仍尊重 enabled，除非 --force
+        cfg = load_cfg()
+        if not args.force and not cfg.get("enabled"):
+            print("[openapi] disabled", flush=True)
+            return 0
+        _daemonize()
+        return run_server(force=True if args.force else False)
+
+    return run_server(force=args.force)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

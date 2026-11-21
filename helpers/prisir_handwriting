@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 灵犀拼音 手写输入 (GTK, ochwpro StrokeTransformer 轨迹模型, 离线)
+# 书写区写字 → 实时 top10 候选 → 点击上屏到焦点窗口 / 复制。
+# 轨迹模型: 书写时采集笔画点 (x,y,pen_down), 直接喂 onnx, 不渲染位图。
+import os
+for _k, _v in (("GTK_IM_MODULE","fcitx"),("QT_IM_MODULE","fcitx"),("XMODIFIERS","@im=fcitx")):
+    if not os.environ.get(_k):
+        os.environ[_k] = _v
+import json, threading, subprocess
+import numpy as np
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib, Pango
+import cairo
+
+MODEL_DIR = "/usr/lib/fcitx5/prisir/hand"
+ONNX = os.path.join(MODEL_DIR, "ochwpro.onnx")
+CHAR_INDEX = os.path.join(MODEL_DIR, "char_index.json")
+FIXED_LEN = 200
+
+def is_cjk(ch):
+    cp = ord(ch)
+    return ((0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or
+            (0x20000 <= cp <= 0x2A6DF) or (0x2A700 <= cp <= 0x2B73F) or
+            (0x2B740 <= cp <= 0x2B81F) or (0x2B820 <= cp <= 0x2CEAF) or
+            (0xF900 <= cp <= 0xFAFF) or (0x2F800 <= cp <= 0x2FA1F))
+
+def simplify_strokes(strokes, mps=8):
+    out = []
+    for stroke in strokes:
+        n = len(stroke)
+        if n <= mps:
+            out.append(stroke); continue
+        step = (n - 1) / (mps - 1)
+        idx = [int(round(i * step)) for i in range(mps)]
+        idx[-1] = n - 1
+        out.append([stroke[i] for i in idx])
+    return out
+
+def strokes_to_sequence(strokes):
+    all_x = [p[0] for s in strokes for p in s]
+    all_y = [p[1] for s in strokes for p in s]
+    min_x, max_x = min(all_x), max(all_x)
+    min_y, max_y = min(all_y), max(all_y)
+    w, h = max(max_x - min_x, 1), max(max_y - min_y, 1)
+    scale = max(w, h)
+    cx, cy = (min_x + max_x) / 2.0, (min_y + max_y) / 2.0
+    feats, first = [], True
+    prev_x = prev_y = 0.0
+    for stroke in strokes:
+        for j, (x, y) in enumerate(stroke):
+            nx = (x - cx) / scale + 0.5
+            ny = (y - cy) / scale + 0.5
+            if first:
+                dx = dy = 0.0; first = False
+            else:
+                dx, dy = nx - prev_x, ny - prev_y
+            feats.append([nx, ny, dx, dy, 1.0 if j > 0 else 0.0])
+            prev_x, prev_y = nx, ny
+    return np.asarray(feats, dtype=np.float32)
+
+class Recognizer:
+    def __init__(self):
+        self.ok = False
+        self.err = ""
+    def load(self):
+        try:
+            import onnxruntime as ort
+            self.chars = json.load(open(CHAR_INDEX, encoding="utf-8"))["chars"]
+            self.sess = ort.InferenceSession(ONNX)
+            self.iname = self.sess.get_inputs()[0].name
+            self.mname = self.sess.get_inputs()[1].name
+            self.ok = True
+        except Exception as e:
+            self.err = str(e)
+    def predict(self, strokes, top_k=10):
+        strokes = simplify_strokes(strokes)
+        seq = strokes_to_sequence(strokes)
+        T = seq.shape[0]
+        if T < FIXED_LEN:
+            pad = FIXED_LEN - T
+            x = np.concatenate([seq[None], np.zeros((1, pad, 5), np.float32)], axis=1)
+            m = np.concatenate([np.ones((1, T), bool), np.zeros((1, pad), bool)], axis=1)
+        else:
+            x = seq[None, :FIXED_LEN, :]; m = np.ones((1, FIXED_LEN), bool)
+        logits = self.sess.run(None, {self.iname: x, self.mname: m})[0][0]
+        e = np.exp(logits - logits.max()); probs = e / e.sum()
+        res, seen = [], set()
+        for i in np.argsort(probs)[::-1][:top_k * 5]:
+            ch = self.chars[i]
+            if is_cjk(ch) and ch not in seen:
+                res.append((ch, float(probs[i]))); seen.add(ch)
+                if len(res) >= top_k: break
+        if len(res) < top_k:
+            for i in np.argsort(probs)[::-1][:top_k]:
+                ch = self.chars[i]
+                if ch not in seen:
+                    res.append((ch, float(probs[i]))); seen.add(ch)
+                    if len(res) >= top_k: break
+        return res[:top_k]
+
+def copy_clip(s):
+    try:
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        cb.set_text(s, -1); cb.store(); return True
+    except Exception:
+        return False
+
+def _active_window():
+    """当前前台窗口 id(十进制)。失败返 None。"""
+    try:
+        out = subprocess.run(["xdotool", "getactivewindow"], capture_output=True, text=True, timeout=3)
+        w = out.stdout.strip()
+        return w if w.isdigit() else None
+    except Exception:
+        return None
+
+def type_to_focus(s, target_win=None):
+    """把 s 上屏到目标窗口:先激活目标窗(若给了),再 xdotool type。
+    手写窗设了 accept_focus=False,焦点本就在目标窗,通常直接 type 即可。"""
+    try:
+        if target_win:
+            subprocess.run(["xdotool", "windowactivate", "--sync", target_win],
+                           capture_output=True, timeout=3)
+        subprocess.run(["xdotool", "type", "--delay", "30", "--", s], check=False)
+        return True
+    except Exception:
+        return False
+
+class HandWin(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self, title="灵犀拼音 手写输入")
+        self.set_default_size(480, 560)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("destroy", Gtk.main_quit)
+        # 对齐 Win 端:手写窗不抢前台焦点(书写/点候选时焦点留在目标 app),
+        # 上屏直接 xdotool type 直达目标窗,窗口保持开着,清板后可连续写下一个字。
+        self.set_accept_focus(False)
+        self.set_keep_above(True)
+        self.rec = Recognizer()
+        self.strokes = []          # 已完成笔画 [[(x,y),...],...]
+        self.current = []          # 当前笔画
+        self.candidates = []
+        self._target_win = None    # 打开手写窗前的前台窗口(上屏目标)
+
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        v.set_border_width(8); self.add(v)
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        v.pack_start(top, False, False, 0)
+        self.status = Gtk.Label(label="正在加载模型…", xalign=0)
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        top.pack_start(self.status, True, True, 0)
+        ub = Gtk.Button(label="撤销"); ub.connect("clicked", self.on_undo); top.pack_start(ub, False, False, 0)
+        cb = Gtk.Button(label="清空"); cb.connect("clicked", self.on_clear); top.pack_start(cb, False, False, 0)
+
+        # 书写区 (DrawingArea)
+        self.area = Gtk.DrawingArea()
+        self.area.set_size_request(-1, 320)
+        self.area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_MOTION_MASK |
+                             Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+        self.area.connect("draw", self.on_draw)
+        self.area.connect("button-press-event", self.on_down)
+        self.area.connect("motion-notify-event", self.on_move)
+        self.area.connect("button-release-event", self.on_up)
+        v.pack_start(self.area, True, True, 0)
+
+        # 候选区 (10 按钮两行)
+        self.cand_grid = Gtk.Grid(); self.cand_grid.set_row_spacing(4); self.cand_grid.set_column_spacing(4)
+        v.pack_start(self.cand_grid, False, False, 0)
+        self.cand_btns = []
+        for i in range(10):
+            b = Gtk.Button(label="")
+            b.set_size_request(80, 56)
+            b.connect("clicked", self.on_pick, i)
+            self.cand_grid.attach(b, i % 5, i // 5, 1, 1)
+            self.cand_btns.append(b)
+
+        bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        v.pack_start(bot, False, False, 0)
+        cpb = Gtk.Button(label="复制首候选"); cpb.connect("clicked", self.on_copy); bot.pack_start(cpb, True, True, 0)
+        tpb = Gtk.Button(label="上屏首候选"); tpb.connect("clicked", self.on_type); bot.pack_start(tpb, True, True, 0)
+
+        threading.Thread(target=self._load_bg, daemon=True).start()
+        # 记录打开本窗前的前台窗口作为上屏目标(此时本窗还没抢到焦点)。
+        GLib.idle_add(self._capture_target)
+
+    def _capture_target(self):
+        w = _active_window()
+        # 若当前前台就是本窗(竞态),不覆盖;否则记下目标窗。
+        if w:
+            self._target_win = w
+        return False
+
+    def _load_bg(self):
+        self.rec.load()
+        GLib.idle_add(self._on_loaded)
+
+    def _on_loaded(self):
+        if self.rec.ok:
+            self.status.set_text("就绪 — 书写区写字, 点候选上屏")
+        else:
+            self.status.set_text("模型加载失败: " + self.rec.err)
+
+    # ── 轨迹采集 ──
+    def on_down(self, w, ev):
+        if ev.button == 1:
+            self.current = [(ev.x, ev.y)]
+            self.area.queue_draw()
+    def on_move(self, w, ev):
+        if self.current and (ev.state & Gdk.ModifierType.BUTTON1_MASK):
+            self.current.append((ev.x, ev.y))
+            self.area.queue_draw()
+    def on_up(self, w, ev):
+        if ev.button == 1 and self.current:
+            self.current.append((ev.x, ev.y))
+            if len(set(self.current)) >= 2:
+                self.strokes.append(self.current)
+            self.current = []
+            self.area.queue_draw()
+            if self.strokes:
+                self._predict_async()
+
+    def on_draw(self, w, cr):
+        cr.set_source_rgb(1, 1, 1); cr.paint()
+        cr.set_source_rgb(0, 0, 0); cr.set_line_width(3); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        for stroke in self.strokes + ([self.current] if self.current else []):
+            if len(stroke) < 2: continue
+            cr.move_to(*stroke[0])
+            for p in stroke[1:]:
+                cr.line_to(*p)
+            cr.stroke()
+        return False
+
+    def _predict_async(self):
+        if not self.rec.ok: return
+        ss = [list(s) for s in self.strokes]
+        threading.Thread(target=self._recog_bg, args=(ss,), daemon=True).start()
+
+    def _recog_bg(self, ss):
+        try:
+            res = self.rec.predict(ss)
+            GLib.idle_add(self._on_recog, res)
+        except Exception as e:
+            GLib.idle_add(lambda: self.status.set_text("识别出错: %s" % e))
+
+    def _on_recog(self, res):
+        self.candidates = res
+        for i, b in enumerate(self.cand_btns):
+            if i < len(res):
+                ch, p = res[i]
+                b.set_label("%s\n%.0f%%" % (ch, p * 100))
+            else:
+                b.set_label("")
+        if res:
+            self.status.set_text("最佳: %s (%.0f%%)" % (res[0][0], res[0][1] * 100))
+
+    def on_pick(self, b, i):
+        if i < len(self.candidates):
+            ch = self.candidates[i][0]
+            self._commit(ch)
+
+    def _commit(self, ch):
+        # 上屏到目标窗口,窗口保持开着 + 自动清板,可连续书写(对齐 Win 端)。
+        tw = self._target_win
+        self.status.set_text("已上屏: " + ch)
+        self.on_clear(None)
+        # 异步上屏,避免阻塞 UI;窗口不动。
+        threading.Thread(target=type_to_focus, args=(ch, tw), daemon=True).start()
+
+    def on_copy(self, b):
+        if self.candidates:
+            self.status.set_text("已复制: " + self.candidates[0][0] if copy_clip(self.candidates[0][0]) else "复制失败")
+
+    def on_type(self, b):
+        if self.candidates:
+            self._commit(self.candidates[0][0])
+
+    def on_undo(self, b):
+        if self.strokes:
+            self.strokes.pop()
+            self.area.queue_draw()
+            if self.strokes: self._predict_async()
+            else: self.on_clear(None)
+
+    def on_clear(self, b):
+        self.strokes = []; self.current = []; self.candidates = []
+        for bb in self.cand_btns: bb.set_label("")
+        self.area.queue_draw()
+        if self.rec.ok: self.status.set_text("已清空 — 书写区写字")
+
+win = HandWin()
+win.show_all()
+Gtk.main()

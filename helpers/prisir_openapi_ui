@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""开放 API 设置页 — 启用开关 + 自定义端口（对齐 Win 可配置）。"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import traceback
+import urllib.request
+from pathlib import Path
+
+for _k, _v in (("GTK_IM_MODULE", "fcitx"), ("QT_IM_MODULE", "fcitx"), ("XMODIFIERS", "@im=fcitx")):
+    if not os.environ.get(_k):
+        os.environ[_k] = _v
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gdk
+
+HELPER = "/usr/lib/fcitx5/prisir/prisir_openapi"
+CFG_DIR = Path.home() / ".config" / "prisir"
+CFG_PATH = CFG_DIR / "open_api.json"
+DEFAULT_PORT = 23331
+
+
+def load_cfg() -> dict:
+    cfg = {"enabled": False, "port": DEFAULT_PORT, "bind": "127.0.0.1"}
+    if CFG_PATH.exists():
+        try:
+            data = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg.update(data)
+        except Exception:
+            pass
+    try:
+        cfg["port"] = int(cfg.get("port") or DEFAULT_PORT)
+    except (TypeError, ValueError):
+        cfg["port"] = DEFAULT_PORT
+    if not (1 <= int(cfg["port"]) <= 65535):
+        cfg["port"] = DEFAULT_PORT
+    cfg["enabled"] = bool(cfg.get("enabled"))
+    cfg["bind"] = "127.0.0.1"
+    return cfg
+
+
+def save_cfg(cfg: dict) -> None:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    out = {
+        "enabled": bool(cfg.get("enabled")),
+        "port": int(cfg.get("port") or DEFAULT_PORT),
+        "bind": "127.0.0.1",
+    }
+    CFG_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def probe(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.5) as r:
+            return b'"ok"' in r.read()
+    except Exception:
+        return False
+
+
+def apply_daemon(enabled: bool) -> str:
+    if not Path(HELPER).exists():
+        return f"找不到 {HELPER}"
+    try:
+        # 始终先停服务再按需启动，避免旧端口残留；--stop 不得误杀本 UI
+        r1 = subprocess.run(
+            [HELPER, "--stop"], capture_output=True, text=True, timeout=8)
+        if not enabled:
+            out = ((r1.stdout or "") + (r1.stderr or "")).strip()
+            return out or "已停止"
+        r2 = subprocess.run(
+            [HELPER, "--start"], capture_output=True, text=True, timeout=12)
+        out = ((r2.stdout or "") + (r2.stderr or "")).strip()
+        return out or ("已启动" if r2.returncode == 0 else f"启动失败 exit={r2.returncode}")
+    except Exception as e:
+        return str(e)
+
+
+class SettingsWin(Gtk.Window):
+    """明确的设置窗口：开关 + 端口 + 状态 + 应用。"""
+
+    def __init__(self):
+        Gtk.Window.__init__(self, title="开放 API 设置")
+        self.set_default_size(520, 380)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_keep_above(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.connect("destroy", Gtk.main_quit)
+
+        cfg = load_cfg()
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        outer.set_border_width(16)
+        self.add(outer)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='large'><b>灵犀拼音 · 开放 API</b></span>")
+        title.set_xalign(0)
+        outer.pack_start(title, False, False, 0)
+
+        desc = Gtk.Label()
+        desc.set_line_wrap(True)
+        desc.set_xalign(0)
+        desc.set_text(
+            "供本机 AI Agent 接入，查询候选 / 学习词条 / 简繁等。\n"
+            "默认关闭；开启后仅监听 127.0.0.1，可自定义端口。"
+        )
+        outer.pack_start(desc, False, False, 0)
+
+        # —— 启用 ——
+        frame1 = Gtk.Frame(label="服务")
+        box1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box1.set_border_width(10)
+        frame1.add(box1)
+
+        row_en = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row_en.pack_start(Gtk.Label(label="启用开放 API", xalign=0), True, True, 0)
+        self.sw = Gtk.Switch()
+        self.sw.set_active(bool(cfg.get("enabled")))
+        self.sw.set_valign(Gtk.Align.CENTER)
+        row_en.pack_end(self.sw, False, False, 0)
+        box1.pack_start(row_en, False, False, 0)
+
+        # —— 端口 ——
+        row_port = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row_port.pack_start(Gtk.Label(label="监听端口", xalign=0), True, True, 0)
+        adj = Gtk.Adjustment(
+            value=float(cfg.get("port") or DEFAULT_PORT),
+            lower=1024, upper=65535, step_increment=1, page_increment=10)
+        self.port = Gtk.SpinButton(adjustment=adj, climb_rate=1, digits=0)
+        self.port.set_numeric(True)
+        self.port.set_width_chars(7)
+        row_port.pack_end(self.port, False, False, 0)
+        box1.pack_start(row_port, False, False, 0)
+
+        hint = Gtk.Label(label="建议 1024–65535；默认 23331。改端口后点「应用」生效。", xalign=0)
+        hint.get_style_context().add_class("dim-label")
+        box1.pack_start(hint, False, False, 0)
+        outer.pack_start(frame1, False, False, 0)
+
+        # —— 状态 ——
+        frame2 = Gtk.Frame(label="当前状态")
+        box2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box2.set_border_width(10)
+        frame2.add(box2)
+        self.status = Gtk.Label(label="…", xalign=0)
+        self.status.set_line_wrap(True)
+        box2.pack_start(self.status, False, False, 0)
+        self.cfg_path = Gtk.Label(label=f"配置：{CFG_PATH}", xalign=0)
+        self.cfg_path.set_selectable(True)
+        box2.pack_start(self.cfg_path, False, False, 0)
+        outer.pack_start(frame2, False, False, 0)
+
+        # —— 示例 ——
+        frame3 = Gtk.Frame(label="调用示例")
+        box3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box3.set_border_width(10)
+        frame3.add(box3)
+        self.example = Gtk.Label(label="", xalign=0)
+        self.example.set_selectable(True)
+        self.example.set_line_wrap(True)
+        box3.pack_start(self.example, False, False, 0)
+        outer.pack_start(frame3, True, True, 0)
+
+        # —— 按钮 ——
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.msg = Gtk.Label(label="", xalign=0)
+        btns.pack_start(self.msg, True, True, 0)
+        refresh = Gtk.Button(label="刷新状态")
+        refresh.connect("clicked", lambda *_: self.refresh_status())
+        btns.pack_end(refresh, False, False, 0)
+        apply = Gtk.Button(label="应用")
+        apply.get_style_context().add_class("suggested-action")
+        apply.connect("clicked", self.on_apply)
+        btns.pack_end(apply, False, False, 0)
+        outer.pack_start(btns, False, False, 0)
+
+        self.refresh_status()
+        GLib.timeout_add(2000, self._tick)
+        # 强制置前，避免被输入法面板挡住误以为没开
+        GLib.idle_add(self._raise)
+
+    def _raise(self):
+        try:
+            self.present()
+            self.set_keep_above(True)
+        except Exception:
+            pass
+        return False
+
+    def _tick(self):
+        if self.get_visible():
+            self.refresh_status(quiet=True)
+        return True
+
+    def refresh_status(self, quiet: bool = False):
+        cfg = load_cfg()
+        port = int(self.port.get_value()) if hasattr(self, "port") else int(cfg.get("port") or DEFAULT_PORT)
+        # 探测实际配置端口与当前旋钮端口
+        cfg_port = int(cfg.get("port") or DEFAULT_PORT)
+        up_cfg = probe(cfg_port)
+        up_ui = probe(port) if port != cfg_port else up_cfg
+        self.status.set_markup(
+            f"配置启用：<b>{'是' if cfg.get('enabled') else '否'}</b>　"
+            f"配置端口：<b>{cfg_port}</b>　"
+            f"监听：<b>{'运行中' if up_cfg else '未运行'}</b>"
+            + (f"\n旋钮端口 {port}：{'可达' if up_ui else '不可达'}" if port != cfg_port else "")
+        )
+        self.example.set_text(
+            f"curl -s http://127.0.0.1:{cfg_port}/health\n"
+            f"curl -s http://127.0.0.1:{cfg_port}/rpc -H 'Content-Type: application/json' \\\n"
+            f"  -d '{{\"jsonrpc\":\"2.0\",\"method\":\"query\","
+            f"\"params\":{{\"pinyin\":\"nihao\"}},\"id\":1}}'"
+        )
+        if not quiet:
+            self.msg.set_text("")
+
+    def on_apply(self, *_):
+        enabled = bool(self.sw.get_active())
+        port = int(self.port.get_value())
+        if not (1024 <= port <= 65535):
+            self.msg.set_markup("<span foreground='#c0392b'>端口须在 1024–65535</span>")
+            return
+        cfg = {"enabled": enabled, "port": port, "bind": "127.0.0.1"}
+        try:
+            save_cfg(cfg)
+        except Exception as e:
+            self.msg.set_markup(f"<span foreground='#c0392b'>保存失败：{e}</span>")
+            return
+
+        self.msg.set_text("正在应用…")
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+
+        note = apply_daemon(enabled)
+        # 再等一轮，给引擎加载留时间
+        if enabled:
+            for _ in range(40):
+                if probe(port):
+                    break
+                GLib.usleep(100000)
+
+        self.refresh_status()
+        if enabled and probe(port):
+            self.msg.set_markup(
+                f"<span foreground='#27ae60'>已开启 · 监听 127.0.0.1:{port}</span>")
+        elif enabled:
+            self.msg.set_markup(
+                f"<span foreground='#c0392b'>已写入配置，但服务未起来：{note}</span>")
+        else:
+            self.msg.set_markup(
+                f"<span foreground='#27ae60'>已关闭开放 API</span>"
+                + (f"（{note}）" if note else ""))
+
+
+def main():
+    # 单实例：已有设置窗则提示
+    w = SettingsWin()
+    w.show_all()
+    w.present()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        # 无显示器时也写日志，方便排查
+        try:
+            Path("/tmp/prisir_openapi_ui.err").write_text(traceback.format_exc(), encoding="utf-8")
+        except Exception:
+            pass
+        sys.exit(1)

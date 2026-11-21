@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 灵犀拼音 关于/隐私/条款/开放API/问题反馈 — Linux
+# 文案对齐当前 Win 端 about.rs（论坛反馈、开放 API；无 AI 助手入口）。
+import os
+for _k, _v in (("GTK_IM_MODULE", "fcitx"), ("QT_IM_MODULE", "fcitx"), ("XMODIFIERS", "@im=fcitx")):
+    if not os.environ.get(_k):
+        os.environ[_k] = _v
+import sys, json, glob, subprocess, traceback, webbrowser
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Pango
+Gtk.init_check([])
+
+WEBSITE_URL = "https://www.babelspan.com/"
+FORUM_URL = "https://bbs.babelspan.com/forum.html#board=browser/ime&hint=prisirai"
+
+ABOUT_BODY = (
+    "灵犀拼音输入法（Linux / fcitx5）由 BabelSpan · Prisir（湃睿思）提供。\n\n"
+    "产品定位：面向个人与专业场景的本地中文输入工具。核心能力包括拼音/混拼候选、"
+    "整句解码、简繁输出、本地词库与用户词典管理。\n\n"
+    "Linux 端不做手写（Win 用系统 Ink，精度远高于自研 ONNX/安卓同款方案）。\n"
+    "语音听写迁移 Win 同款 SenseVoice Small（onnxruntime），需安装模型目录与 pip 依赖。\n"
+    "不做 AI 助手菜单（属独立 PrisirAI 产品）。\n\n"
+    "若需借助 AI Agent 定制输入法，请用菜单「开放 API」：默认关闭，仅 127.0.0.1。\n\n"
+    "官网：https://www.babelspan.com/\n\n"
+    "版权所有 © 2026 BabelSpan。本软件依据 Apache License, Version 2.0 授权，"
+    "按「原样」提供。完整授权见安装目录 LICENSE.txt（Apache License 2.0）。"
+)
+
+PRIVACY_BODY = (
+    "灵犀拼音采用严格的隐私保护设计，完全离线无账号运行：\n\n"
+    "· 键入内容、候选结果与词库数据保存在本机，不向第三方上传输入正文。\n"
+    "· 不提供账号登录，不做行为画像，不出售或交换个人输入数据。\n"
+    "· 用户可通过词库管理自主维护本地词典。\n"
+    "· 可选的语音听写在本机完成识别，不外发音频。\n"
+    "· 开放 API 默认关闭；开启后也仅监听本机 127.0.0.1。\n\n"
+    "输入法本身不主动发起任何网络请求。"
+)
+
+TERMS_BODY = (
+    "使用本软件即表示您知悉并同意：\n\n"
+    "· 本软件为本地工具，安装、配置与使用风险由用户自行承担。\n"
+    "· 请仅将本软件用于合法用途。\n"
+    "· 词库与学习数据归用户本地管理；卸载前请自行备份。\n"
+    "· 完整法律文本以安装目录 LICENSE.txt（Apache License, Version 2.0）为准。\n\n"
+    "官网：https://www.babelspan.com/"
+)
+
+OPENAPI_BODY = (
+    "开放 API 面向「用 AI 帮助用户定制个性化输入法」：本机 Agent / 脚本可通过本地接口"
+    "查询候选、学习词条、简繁与状态。\n\n"
+    "默认关闭。在状态区打开「开放 API」开关后，仅监听 127.0.0.1:23331。\n\n"
+    "配置：~/.config/prisir/open_api.json\n"
+    "端点：GET /health · GET /status · POST /rpc\n"
+    "RPC：version / status / query / learn / classify / sentences / "
+    "to_script / punct / script / open_api.get / open_api.set\n\n"
+    "示例：\n"
+    "  curl -s http://127.0.0.1:23331/health\n"
+    "  curl -s http://127.0.0.1:23331/rpc -H 'Content-Type: application/json' "
+    "-d '{\"jsonrpc\":\"2.0\",\"method\":\"query\","
+    "\"params\":{\"pinyin\":\"nihao\"},\"id\":1}'\n\n"
+    "契约对齐 Windows / Android；Linux 另暴露引擎扩展方法。"
+    "不需要 Agent 时可保持关闭。"
+)
+
+FEEDBACK_BODY = (
+    "如需报告缺陷或提出改进建议，请通过 BabelSpan 论坛提交：\n\n"
+    f"{FORUM_URL}\n\n"
+    "建议说明：发行版与灵犀版本号、复现步骤、期望与实际结果。\n\n"
+    "下方「反馈问题」将在桌面生成诊断包（日志与脱敏环境信息，不含输入正文），并打开论坛。"
+)
+
+SECTIONS = [
+    ("关于", ABOUT_BODY),
+    ("隐私政策", PRIVACY_BODY),
+    ("使用条款", TERMS_BODY),
+    ("开放 API", OPENAPI_BODY),
+    ("问题反馈", FEEDBACK_BODY),
+]
+
+
+def _ts():
+    import datetime
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _desktop():
+    for d in (os.path.expanduser("~/桌面"), os.path.expanduser("~/Desktop")):
+        if os.path.isdir(d):
+            return d
+    return os.path.expanduser("~")
+
+
+def _read_tail(path, cap=512 * 1024):
+    try:
+        with open(path, "rb") as f:
+            return f.read()[-cap:]
+    except Exception:
+        return None
+
+
+def pack_diag():
+    import zipfile, platform
+    desk = _desktop()
+    zpath = os.path.join(desk, f"lingxi-linux-diag-{_ts()}.zip")
+    meta = {
+        "ime": "fcitx5-prisir (Linux)",
+        "os": platform.platform(),
+        "arch": platform.machine(),
+        "python": platform.python_version(),
+    }
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+        z.writestr("system.txt", "\n".join([
+            f"app: fcitx5-prisir Linux",
+            f"timestamp: {_ts()}",
+            f"os: {platform.platform()}",
+            f"kernel: {platform.release()}",
+        ]) + "\n")
+        for p in ("/tmp/fcitx5-debianuser.log", "/tmp/fcitx5-020-test.log"):
+            data = _read_tail(p)
+            if data:
+                z.writestr("logs/" + os.path.basename(p), data)
+    return zpath
+
+
+class AboutWin(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self, title="灵犀拼音 — 关于")
+        self.set_default_size(720, 480)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("destroy", Gtk.main_quit)
+
+        h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        h.set_border_width(10)
+        self.add(h)
+
+        self.store = Gtk.ListStore(str)
+        for title, _ in SECTIONS:
+            self.store.append([title])
+        tree = Gtk.TreeView(model=self.store)
+        tree.append_column(Gtk.TreeViewColumn("栏目", Gtk.CellRendererText(), text=0))
+        tree.get_selection().connect("changed", self.on_sel)
+        sw_l = Gtk.ScrolledWindow()
+        sw_l.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw_l.set_size_request(140, -1)
+        sw_l.add(tree)
+        h.pack_start(sw_l, False, False, 0)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        h.pack_start(right, True, True, 0)
+        self.body = Gtk.TextView()
+        self.body.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.body.set_editable(False)
+        self.body.set_cursor_visible(False)
+        self.buf = self.body.get_buffer()
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(self.body)
+        right.pack_start(sw, True, True, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        right.pack_start(row, False, False, 0)
+        b1 = Gtk.Button(label="反馈问题（打包诊断）")
+        b1.connect("clicked", self.on_feedback)
+        row.pack_end(b1, False, False, 0)
+        b2 = Gtk.Button(label="打开官网")
+        b2.connect("clicked", lambda *_: webbrowser.open(WEBSITE_URL))
+        row.pack_end(b2, False, False, 0)
+
+        tree.get_selection().select_path(Gtk.TreePath.new_first())
+
+    def on_sel(self, sel):
+        model, it = sel.get_selected()
+        if not it:
+            return
+        idx = model.get_path(it).get_indices()[0]
+        self.buf.set_text(SECTIONS[idx][1])
+
+    def on_feedback(self, *_):
+        try:
+            z = pack_diag()
+            dlg = Gtk.MessageDialog(
+                transient_for=self, message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text=f"诊断包已保存：\n{z}\n\n将打开论坛，请上传该 zip。")
+            dlg.run()
+            dlg.destroy()
+            webbrowser.open(FORUM_URL)
+        except Exception as e:
+            dlg = Gtk.MessageDialog(
+                transient_for=self, message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK, text=str(e))
+            dlg.run()
+            dlg.destroy()
+
+
+def main():
+    w = AboutWin()
+    w.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
