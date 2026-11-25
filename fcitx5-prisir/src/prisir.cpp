@@ -117,11 +117,12 @@ public:
         std::string home = base ? base : "/usr/lib/fcitx5/prisir";
         engine_.open(home + "/libprisir_ime.so", home + "/ciku.db");
 
-        // 状态区菜单（Win 选择性迁移）：词库/符号/语音/简繁/开放API/关于。
+        // 状态区菜单（Win 选择性迁移）：词库/造词/符号/语音/简繁/开放API/关于。
         // 不做：AI 助手；手写（安卓同款自研 ONNX，精度远差于 Win 系统 Ink）。
         // 语音：迁移 Win SenseVoice Small + onnxruntime（与 lingxi_voice 同模型）。
         auto &uim = instance_->userInterfaceManager();
         setupAction(uim, actionDict_, "prisir-dict", "词库管理", "prisir_dict");
+        setupAction(uim, actionQuickAdd_, "prisir-quick-add", "灵犀造词", "prisir_quick_add");
         setupAction(uim, actionSym_, "prisir-sym", "符号大全", "prisir_symbols");
         // 语音听写：点菜单 = toggle；热键设置在录音浮窗「热键」按钮。
         // 常驻 daemon + 右 Alt 由开机自启 / activate 时 --start 保证。
@@ -156,6 +157,7 @@ public:
         // InputMethod 组在 activate 前会被清空，每次激活重新挂上。
         auto &area = ic->statusArea();
         area.addAction(fcitx::StatusGroup::InputMethod, actionDict_.get());
+        area.addAction(fcitx::StatusGroup::InputMethod, actionQuickAdd_.get());
         area.addAction(fcitx::StatusGroup::InputMethod, actionSym_.get());
         area.addAction(fcitx::StatusGroup::InputMethod, actionVoice_.get());
         area.addAction(fcitx::StatusGroup::InputMethod, actionScript_.get());
@@ -403,6 +405,7 @@ private:
     fcitx::FactoryFor<PrisirState> factory_{
         [](fcitx::InputContext &) { return new PrisirState; }};
     std::unique_ptr<fcitx::SimpleAction> actionDict_;
+    std::unique_ptr<fcitx::SimpleAction> actionQuickAdd_;
     std::unique_ptr<fcitx::SimpleAction> actionSym_;
     std::unique_ptr<fcitx::SimpleAction> actionVoice_;
     std::unique_ptr<fcitx::SimpleAction> actionAbout_;

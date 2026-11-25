@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 灵犀造词 — Linux GTK helper，对齐 Win 端 quick_add_window.rs
+# 走引擎 FFI：auto_code / word_pinyin / user_add_pos（写 user.db，主行全拼+别名简拼）。
+import os
+for _k, _v in (("GTK_IM_MODULE", "fcitx"), ("QT_IM_MODULE", "fcitx"), ("XMODIFIERS", "@im=fcitx")):
+    if not os.environ.get(_k):
+        os.environ[_k] = _v
+
+import ctypes
+import re
+import sys
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib
+Gtk.init_check([])
+
+ENGINE_SO = os.environ.get("PRISIR_IME_SO", "/usr/lib/fcitx5/prisir/libprisir_ime.so")
+ENGINE_DB = os.environ.get("PRISIR_IME_DB", "/usr/lib/fcitx5/prisir/ciku.db")
+
+
+class Engine:
+    def __init__(self):
+        self.lib = None
+        self.handle = None
+        self.error = ""
+
+    def open(self) -> bool:
+        if self.handle:
+            return True
+        try:
+            lib = ctypes.CDLL(ENGINE_SO)
+            lib.prisir_ime_load.restype = ctypes.c_void_p
+            lib.prisir_ime_load.argtypes = [ctypes.c_char_p, ctypes.c_int]
+            lib.prisir_ime_free.argtypes = [ctypes.c_void_p]
+            lib.prisir_ime_free_string.argtypes = [ctypes.c_void_p]
+            lib.prisir_ime_auto_code.restype = ctypes.c_void_p
+            lib.prisir_ime_auto_code.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            lib.prisir_ime_word_pinyin.restype = ctypes.c_void_p
+            lib.prisir_ime_word_pinyin.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            lib.prisir_ime_user_add_pos.restype = ctypes.c_int
+            lib.prisir_ime_user_add_pos.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int64]
+            h = lib.prisir_ime_load(ENGINE_DB.encode(), 0)
+            if not h:
+                self.error = "prisir_ime_load 失败: " + ENGINE_DB
+                return False
+            self.lib = lib
+            self.handle = h
+            return True
+        except Exception as e:
+            self.error = str(e)
+            return False
+
+    def _take(self, ptr) -> str:
+        if not ptr:
+            return ""
+        s = ctypes.string_at(ptr).decode("utf-8", "replace")
+        self.lib.prisir_ime_free_string(ptr)
+        return s.replace(" ", "")
+
+    def auto_code(self, word: str) -> str:
+        if not self.open():
+            return ""
+        return self._take(self.lib.prisir_ime_auto_code(self.handle, word.encode("utf-8")))
+
+    def word_pinyin(self, word: str) -> str:
+        if not self.open():
+            return ""
+        return self._take(self.lib.prisir_ime_word_pinyin(self.handle, word.encode("utf-8")))
+
+    def add_pos(self, code: str, word: str, pos: int) -> bool:
+        if not self.open():
+            return False
+        return self.lib.prisir_ime_user_add_pos(
+            self.handle,
+            code.encode("utf-8"),
+            word.encode("utf-8"),
+            ctypes.c_int64(max(1, min(50, pos))),
+        ) == 1
+
+    def close(self):
+        if self.handle and self.lib:
+            self.lib.prisir_ime_free(self.handle)
+            self.handle = None
+
+
+def sanitize_code(s: str) -> str:
+    return re.sub(r"[^a-zA-Z]", "", s).lower()
+
+
+class QuickAddWin(Gtk.Window):
+    def __init__(self, seed: str = ""):
+        Gtk.Window.__init__(self, title="灵犀造词")
+        self.set_default_size(420, 220)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_border_width(12)
+        self.connect("destroy", self.on_destroy)
+        self.connect("key-press-event", self.on_key)
+        self.engine = Engine()
+        self.code_auto = True
+        self._setting = False
+
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(v)
+
+        # 词条
+        r1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        v.pack_start(r1, False, False, 0)
+        r1.pack_start(Gtk.Label(label="词条", xalign=0, width_chars=4), False, False, 0)
+        self.e_word = Gtk.Entry()
+        self.e_word.set_placeholder_text("输入或粘贴中文词条")
+        self.e_word.connect("changed", self.on_word_changed)
+        r1.pack_start(self.e_word, True, True, 0)
+
+        # 编码
+        r2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        v.pack_start(r2, False, False, 0)
+        r2.pack_start(Gtk.Label(label="编码", xalign=0, width_chars=4), False, False, 0)
+        self.e_code = Gtk.Entry()
+        self.e_code.set_width_chars(18)
+        self.e_code.connect("changed", self.on_code_changed)
+        r2.pack_start(self.e_code, False, False, 0)
+        r2.pack_start(Gtk.Label(label="自动拆简拼，可手改", xalign=0), False, False, 0)
+
+        # 位置 + 继续造词
+        r3 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        v.pack_start(r3, False, False, 0)
+        r3.pack_start(Gtk.Label(label="位置", xalign=0, width_chars=4), False, False, 0)
+        self.e_pos = Gtk.Entry()
+        self.e_pos.set_text("1")
+        self.e_pos.set_width_chars(4)
+        r3.pack_start(self.e_pos, False, False, 0)
+        r3.pack_start(Gtk.Label(label="候选第几位(1 起)", xalign=0), False, False, 0)
+        self.chk_more = Gtk.CheckButton(label="继续造词")
+        r3.pack_start(self.chk_more, False, False, 8)
+
+        self.status = Gtk.Label(label="", xalign=0)
+        self.status.set_line_wrap(True)
+        self.status.set_max_width_chars(48)
+        v.pack_start(self.status, True, True, 0)
+
+        bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        v.pack_start(bot, False, False, 0)
+        bot.pack_start(Gtk.Label(label="Enter 保存 · Esc 退出", xalign=0), True, True, 0)
+        cancel = Gtk.Button(label="取消")
+        cancel.connect("clicked", lambda *_: self.destroy())
+        bot.pack_start(cancel, False, False, 0)
+        save = Gtk.Button(label="保存")
+        save.get_style_context().add_class("suggested-action")
+        save.connect("clicked", self.on_save)
+        bot.pack_start(save, False, False, 0)
+
+        if not self.engine.open():
+            self.status.set_text("引擎未就绪: " + (self.engine.error or "未知错误"))
+        if seed:
+            self._setting = True
+            self.e_word.set_text(seed)
+            self._setting = False
+            self.maybe_autofill()
+        GLib.idle_add(self.e_word.grab_focus)
+
+    def on_destroy(self, *_):
+        self.engine.close()
+        Gtk.main_quit()
+
+    def on_key(self, _w, ev):
+        if ev.keyval in (Gdk.KEY_Escape,):
+            self.destroy()
+            return True
+        if ev.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.on_save()
+            return True
+        return False
+
+    def on_word_changed(self, *_):
+        if self._setting:
+            return
+        self.maybe_autofill()
+
+    def on_code_changed(self, *_):
+        if self._setting:
+            return
+        # 用户手改编码后不再自动覆盖
+        self.code_auto = False
+
+    def maybe_autofill(self):
+        if not self.code_auto:
+            return
+        word = self.e_word.get_text().strip()
+        if not word:
+            return
+        # 显示用简拼；保存时引擎会优先全拼写主行
+        code = self.engine.auto_code(word)
+        if code and code != self.e_code.get_text():
+            self._setting = True
+            self.e_code.set_text(code)
+            self._setting = False
+
+    def on_save(self, *_):
+        word = self.e_word.get_text().strip()
+        if not word:
+            self.status.set_text("词条为空：先复制中文词条，或直接在这里输入。")
+            self.e_word.grab_focus()
+            return
+        if len(word) > 30:
+            self.status.set_text("词条太长(>30 字)，像是一段话而不是词条。")
+            return
+        code = sanitize_code(self.e_code.get_text())
+        if not code:
+            # 优先全拼当主 key（与 Win add_word_auto 一致）
+            code = self.engine.word_pinyin(word) or self.engine.auto_code(word)
+            if not code and word.isascii():
+                code = word.lower()
+        if not code:
+            self.status.set_text("推导不出编码(可能含生僻字)，请手填编码。")
+            self.e_code.grab_focus()
+            return
+        try:
+            pos = int(self.e_pos.get_text().strip() or "1")
+        except ValueError:
+            pos = 1
+        pos = max(1, min(50, pos))
+
+        # 保存前再取一次全拼作主 key；若用户手填了自定义码则用自定义
+        given = sanitize_code(self.e_code.get_text())
+        if given:
+            save_code = given
+        else:
+            save_code = self.engine.word_pinyin(word) or code
+
+        if self.engine.add_pos(save_code, word, pos):
+            self.status.set_text("已加入：%s → %s（候选第 %d 位）" % (word, save_code, pos))
+            if self.chk_more.get_active():
+                self._setting = True
+                self.e_word.set_text("")
+                self.e_code.set_text("")
+                self._setting = False
+                self.code_auto = True
+                self.e_word.grab_focus()
+            else:
+                self.destroy()
+        else:
+            self.status.set_text("保存失败：引擎未就绪或词库不可写。")
+
+
+def main():
+    seed = ""
+    for a in sys.argv[1:]:
+        if a and not a.startswith("-"):
+            seed = a
+            break
+    # 无参数时尝试剪贴板中文
+    if not seed:
+        try:
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            t = clip.wait_for_text() or ""
+            t = t.strip()
+            if t and any("\u4e00" <= c <= "\u9fff" for c in t) and len(t) <= 30:
+                seed = t
+        except Exception:
+            pass
+    win = QuickAddWin(seed)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

@@ -78,8 +78,8 @@ elif [[ -f "$ROOT/packaging/LICENSE.txt" ]]; then
   install -m 0644 "$ROOT/packaging/LICENSE.txt" "$STAGE/usr/lib/fcitx5/prisir/LICENSE.txt"
 fi
 
-# helpers：词库/符号/语音/关于/开放API。不打包手写/AI。
-for h in prisir_dict prisir_dict.py prisir_symbols prisir_about prisir_voice prisir_openapi prisir_openapi_ui; do
+# helpers：词库/造词/符号/语音/关于/开放API。不打包手写/AI。
+for h in prisir_dict prisir_dict.py prisir_quick_add prisir_symbols prisir_about prisir_voice prisir_openapi prisir_openapi_ui; do
   if [[ -f "$HELPERS/$h" ]]; then
     install -m 0755 "$HELPERS/$h" "$STAGE/usr/lib/fcitx5/prisir/$h"
   fi

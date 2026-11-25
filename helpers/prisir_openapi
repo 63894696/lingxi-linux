@@ -11,7 +11,13 @@
 
 方法（对齐 Win/Android + Linux 引擎扩展）：
   version | status | query | open_api.get | open_api.set
-  learn | classify | sentences | to_script | punct | punct_reset | script
+  learn | user_add | user_add_batch | classify | sentences | to_script
+  punct | punct_reset | script
+
+造词（Agent 批量加词用；与 GUI「灵犀造词」同引擎入口）：
+  user_add        params: {word, pinyin?, pos?}  → 手工词(pos 插位,全拼主行+简拼别名)
+  user_add_batch  params: {words:[{word,pinyin?,pos?},...]} 或 {items:[...]}
+  learn           仍是「自动学成」(seq>0 置顶)，语义不同，日常灌专名请用 user_add*
 
 启动：
   prisir_openapi                 # enabled=true 才监听；否则退出 0
@@ -120,6 +126,14 @@ class Engine:
         lib.prisir_ime_query.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         lib.prisir_ime_free_string.argtypes = [ctypes.c_void_p]
         lib.prisir_ime_learn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+        # 灵犀造词 FFI（与 Win quick_add / add_word_auto 同入口）
+        lib.prisir_ime_auto_code.restype = ctypes.c_void_p
+        lib.prisir_ime_auto_code.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.prisir_ime_word_pinyin.restype = ctypes.c_void_p
+        lib.prisir_ime_word_pinyin.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.prisir_ime_user_add_pos.restype = ctypes.c_int
+        lib.prisir_ime_user_add_pos.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int64]
         lib.prisir_ime_classify.restype = ctypes.c_int
         lib.prisir_ime_classify.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         lib.prisir_ime_sentences.restype = ctypes.c_void_p
@@ -168,6 +182,51 @@ class Engine:
         with self._lock:
             self.lib.prisir_ime_learn(
                 self.handle, pinyin.encode("utf-8"), word.encode("utf-8"))
+
+    def auto_code(self, word: str) -> str:
+        self.open()
+        with self._lock:
+            return self._take_str(
+                self.lib.prisir_ime_auto_code(self.handle, word.encode("utf-8"))
+            ).replace(" ", "")
+
+    def word_pinyin(self, word: str) -> str:
+        self.open()
+        with self._lock:
+            return self._take_str(
+                self.lib.prisir_ime_word_pinyin(self.handle, word.encode("utf-8"))
+            ).replace(" ", "")
+
+    def user_add_pos(self, code: str, word: str, pos: int = 1) -> bool:
+        self.open()
+        pos = max(1, min(50, int(pos)))
+        with self._lock:
+            return self.lib.prisir_ime_user_add_pos(
+                self.handle,
+                code.encode("utf-8"),
+                word.encode("utf-8"),
+                ctypes.c_int64(pos),
+            ) == 1
+
+    def add_word_auto(self, word: str, pinyin: str | None = None, pos: int = 1) -> str:
+        """对齐 Win ffi::add_word_auto：编码优先调用方，其次全拼，再简拼。"""
+        word = (word or "").strip()
+        if not word:
+            raise ValueError("词条为空")
+        if len(word) > 30:
+            raise ValueError("词条太长(>30 字),像是一段话而不是词条")
+        given = "".join(c for c in (pinyin or "").strip() if c.isalpha()).lower()
+        if given:
+            code = given
+        else:
+            code = self.word_pinyin(word) or self.auto_code(word)
+            if not code and word.isascii():
+                code = word.lower()
+        if not code:
+            raise ValueError(f"算不出「{word}」的编码,请传 pinyin")
+        if not self.user_add_pos(code, word, pos):
+            raise RuntimeError("写入词库失败(引擎未加载或词库不可写)")
+        return code
 
     def classify(self, text: str) -> int:
         self.open()
@@ -294,6 +353,68 @@ def rpc(body: str) -> dict:
                 return err(-32602, "params.pinyin and params.word required")
             ENGINE.learn(py, word)
             return ok({"pinyin": py, "word": word, "learned": True})
+        if method in ("user_add", "user_add_pos", "dict.add"):
+            # 灵犀造词单条：word 必填；pinyin 可省(引擎推全拼/简拼)；pos 默认 1
+            word = str(params.get("word") or params.get("text") or "").strip()
+            if not word:
+                return err(-32602, "params.word required")
+            py = params.get("pinyin") or params.get("code") or params.get("input")
+            py = str(py).strip() if py is not None else ""
+            try:
+                pos = int(params.get("pos") if params.get("pos") is not None else 1)
+            except (TypeError, ValueError):
+                pos = 1
+            try:
+                code = ENGINE.add_word_auto(word, py or None, pos)
+            except ValueError as e:
+                return err(-32602, str(e))
+            except RuntimeError as e:
+                return err(-32000, str(e))
+            return ok({"word": word, "pinyin": code, "pos": max(1, min(50, pos)), "added": True})
+        if method in ("user_add_batch", "dict.add_batch"):
+            items = params.get("words") or params.get("items") or params.get("list") or []
+            if isinstance(items, str):
+                # 允许纯文本：按行拆，或中文逗号/顿号分隔的名词列表
+                raw = items.replace("、", "\n").replace("，", "\n").replace(",", "\n")
+                items = [{"word": x.strip()} for x in raw.splitlines() if x.strip()]
+            if not isinstance(items, list) or not items:
+                return err(-32602, "params.words (list) required")
+            if len(items) > 500:
+                return err(-32602, "batch too large (max 500)")
+            default_pos = 1
+            try:
+                if params.get("pos") is not None:
+                    default_pos = int(params.get("pos"))
+            except (TypeError, ValueError):
+                default_pos = 1
+            added, failed = [], []
+            for i, it in enumerate(items):
+                if isinstance(it, str):
+                    it = {"word": it}
+                if not isinstance(it, dict):
+                    failed.append({"index": i, "error": "item must be object or string"})
+                    continue
+                word = str(it.get("word") or it.get("text") or "").strip()
+                if not word:
+                    failed.append({"index": i, "error": "empty word"})
+                    continue
+                py = it.get("pinyin") or it.get("code") or ""
+                py = str(py).strip() if py else ""
+                try:
+                    pos = int(it["pos"]) if it.get("pos") is not None else default_pos
+                except (TypeError, ValueError):
+                    pos = default_pos
+                try:
+                    code = ENGINE.add_word_auto(word, py or None, pos)
+                    added.append({"word": word, "pinyin": code, "pos": max(1, min(50, pos))})
+                except (ValueError, RuntimeError) as e:
+                    failed.append({"index": i, "word": word, "error": str(e)})
+            return ok({
+                "added": added,
+                "failed": failed,
+                "ok": len(added),
+                "err": len(failed),
+            })
         if method == "classify":
             text = str(params.get("input") or params.get("pinyin") or params.get("text") or "")
             if not text:
@@ -425,8 +546,8 @@ class Handler(BaseHTTPRequestHandler):
                 "endpoints": ["GET /health", "GET /status", "POST /rpc"],
                 "methods": [
                     "version", "status", "query", "open_api.get", "open_api.set",
-                    "learn", "classify", "sentences", "to_script", "punct",
-                    "punct_reset", "script",
+                    "learn", "user_add", "user_add_batch", "classify", "sentences",
+                    "to_script", "punct", "punct_reset", "script",
                 ],
                 "default_off": True,
                 "bind": f"{cfg.get('bind', DEFAULT_BIND)}:{cfg.get('port', DEFAULT_PORT)}",
